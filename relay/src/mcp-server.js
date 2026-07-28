@@ -236,6 +236,9 @@ export function startMcpServer(port = 3000) {
   const app = express();
   app.use(express.json());
 
+  // 单例：服务启动时构建一次，所有请求复用，避免每次请求重复注册工具
+  const mcpServer = buildMcpServer();
+
   // Status endpoint
   app.get('/', (_req, res) => {
     const info = getExtensionInfo();
@@ -246,20 +249,19 @@ export function startMcpServer(port = 3000) {
     });
   });
 
-  // MCP endpoint — stateless: new transport per request
+  // MCP endpoint — stateless transport，每请求一个，但 server 复用
   app.all('/mcp', async (req, res) => {
-    const server = buildMcpServer();
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, // stateless mode
+      sessionIdGenerator: undefined, // stateless 模式
     });
 
+    // 请求结束时只关闭 transport，server 单例不关闭
     res.on('close', () => {
       transport.close();
-      server.close();
     });
 
     try {
-      await server.connect(transport);
+      await mcpServer.connect(transport);
       await transport.handleRequest(req, res, req.body);
     } catch (err) {
       console.error('[MCP] Request error:', err.message);
