@@ -70,23 +70,12 @@
       if (!isInteractive(el) || !isVisible(el)) continue;
       const s = score(el);
       if (s > 0) {
+        // 使用 accessibility-tree 的 getOrAssignRef 获取稳定 ref，确保 find→click 链路互通
         const tree = globalThis.__accessibilityTree;
-        const ref = tree ? tree.getElementByRef ? (() => {
-          // get or create ref
-          const existing = [...document.querySelectorAll('[data-bmcp-ref]')];
-          return null;
-        })() : null : null;
-        // Use accessibility tree ref if available
-        const atRef = globalThis.__accessibilityTree?.getElementCoordinates
-          ? (() => {
-              // walk the refMap by checking element identity
-              // simpler: just use a WeakMap approach via the accessibility tree module
-              return null;
-            })()
-          : null;
+        const ref = tree ? tree.getOrAssignRef(el) : `search_${results.length + 1}`;
 
         results.push({
-          ref: atRef || `search_${results.length + 1}`,
+          ref,
           role: el.getAttribute('role') || el.tagName.toLowerCase(),
           text: ((el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g,' ').trim()).slice(0,100),
           score: s,
