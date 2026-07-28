@@ -24,7 +24,7 @@
     const s = getComputedStyle(el);
     if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity) === 0) return false;
     const r = el.getBoundingClientRect();
-    return r.width > 0 || r.height > 0;
+    return r.width > 0 && r.height > 0;
   }
 
   function getRole(el) {
@@ -108,6 +108,11 @@
       const r = el.getBoundingClientRect();
       if (r.width === 0 && r.height === 0) return null;
       return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+    },
+
+    // 为指定元素分配或返回已有的 ref 字符串，供 page-bridge 等外部模块使用
+    getOrAssignRef(el) {
+      return assignRef(el);
     },
   };
 })();
