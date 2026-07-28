@@ -135,16 +135,45 @@ function parseMods(s) {
 
 const SCREENSHOT_QUALITY = { low:{q:20,max:27000}, medium:{q:40,max:270000}, high:{q:60,max:670000} };
 
-async function captureScreenshot(tabId, quality='low') {
+async function captureScreenshot(tabId, quality = 'low') {
   const cfg = SCREENSHOT_QUALITY[quality] || SCREENSHOT_QUALITY.low;
+
+  // 获取当前视口尺寸，用于判断是否需要缩放
+  const MAX_DIM = 2000;
+  let vpResult;
+  try {
+    [vpResult] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => ({ w: window.innerWidth, h: window.innerHeight }),
+    });
+  } catch { vpResult = null; }
+  const vw = vpResult?.result?.w || 1280;
+  const vh = vpResult?.result?.h || 720;
+
+  // 计算缩放比：取宽/高超出 2000px 的最小比例
+  const scale = Math.min(1, MAX_DIM / Math.max(vw, vh));
+
   let q = cfg.q;
   let data;
+  const screenshotParams = {
+    format: 'jpeg',
+    quality: q,
+    captureBeyondViewport: false,
+    fromSurface: true,
+    ...(scale < 1 && {
+      clip: { x: 0, y: 0, width: vw, height: vh, scale },
+    }),
+  };
+
   do {
-    const res = await chrome.debugger.sendCommand({tabId},'Page.captureScreenshot',
-      {format:'jpeg', quality:q, captureBeyondViewport:false, fromSurface:true});
+    screenshotParams.quality = q;
+    const res = await chrome.debugger.sendCommand(
+      { tabId }, 'Page.captureScreenshot', screenshotParams
+    );
     data = res.data;
     q -= 5;
   } while (data.length > cfg.max && q >= 5);
+
   return data;
 }
 
