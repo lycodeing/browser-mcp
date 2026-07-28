@@ -18,10 +18,6 @@ const tabEventBuffers = new Map();
 const cdpReady = new Set();
 // tabId -> true  (content scripts injected)
 const csInjected = new Set();
-// tabId -> policy ('accept'|'dismiss'|'none')
-const beforeunloadPolicies = new Map();
-// tabId -> { handled, accepted }
-const beforeunloadResults = new Map();
 
 // ── WebSocket connection ──────────────────────────────────────────────────────
 function connect() {
@@ -690,12 +686,14 @@ chrome.tabs.onRemoved.addListener(tabId => {
   tabEventBuffers.delete(tabId);
   cdpReady.delete(tabId);
   csInjected.delete(tabId);
-  beforeunloadPolicies.delete(tabId);
-  beforeunloadResults.delete(tabId);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, info) => {
-  if (info.status === 'loading') csInjected.delete(tabId);
+  if (info.status === 'loading') {
+    csInjected.delete(tabId);
+    // 页面开始加载时 CDP 会话失效，需重新附加
+    cdpDetach(tabId).catch(() => {});
+  }
 });
 
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
