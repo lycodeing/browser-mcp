@@ -1,0 +1,17 @@
+{
+  "name": "browser-mcp-relay",
+  "version": "1.0.0",
+  "description": "Browser automation MCP relay for ZCode / Claude Code",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "express": "^4.19.2",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8"
+  }
+}
