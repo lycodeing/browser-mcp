@@ -403,13 +403,26 @@ async function toolNavigate(args) {
   return ok([{type:'text',text:`Navigated to: ${tab.url}${redir}\nTitle: ${tab.title}\nDuration: ${ms}s`}]);
 }
 
-async function waitForLoad(tabId, timeoutMs) {
-  const t0 = Date.now();
-  while (Date.now()-t0 < timeoutMs) {
-    try { if ((await chrome.tabs.get(tabId)).status === 'complete') return true; } catch { return false; }
-    await sleep(100);
-  }
-  return false;
+function waitForLoad(tabId, timeoutMs) {
+  return new Promise((resolve) => {
+    // 先检查是否已经 complete（避免错过已完成的导航）
+    chrome.tabs.get(tabId).then(tab => {
+      if (tab.status === 'complete') { resolve(true); return; }
+
+      const timer = setTimeout(() => {
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve(false);
+      }, timeoutMs);
+
+      function listener(updatedTabId, info) {
+        if (updatedTabId !== tabId || info.status !== 'complete') return;
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve(true);
+      }
+      chrome.tabs.onUpdated.addListener(listener);
+    }).catch(() => resolve(false));
+  });
 }
 
 async function toolJavascript(args) {
