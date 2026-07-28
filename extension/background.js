@@ -203,19 +203,22 @@ async function toolComputer(args) {
       return r?.result ? ok([{type:'text',text:`Scrolled to ${args.ref}`}]) : err(`Element not found: ${args.ref}`);
     }
     case 'type': {
-      const text = args.text||'';
-      for (const ch of text) {
-        const isEnter = ch==='\n'||ch==='\r';
-        const key = isEnter?'Enter':ch, code = isEnter?'Enter':'', vk = isEnter?13:ch.charCodeAt(0);
-        await chrome.debugger.sendCommand({tabId},'Input.dispatchKeyEvent',
-          {type:'keyDown',key,code,windowsVirtualKeyCode:vk,nativeVirtualKeyCode:vk});
-        if (!isEnter) await chrome.debugger.sendCommand({tabId},'Input.dispatchKeyEvent',
-          {type:'char',key,text:ch,unmodifiedText:ch,windowsVirtualKeyCode:vk,nativeVirtualKeyCode:vk});
-        await chrome.debugger.sendCommand({tabId},'Input.dispatchKeyEvent',
-          {type:'keyUp',key,code,windowsVirtualKeyCode:vk,nativeVirtualKeyCode:vk});
-        await sleep(20);
+      const text = args.text || '';
+      if (!text.length) return ok([{ type: 'text', text: 'Typed 0 chars' }]);
+
+      // 按换行符拆分：普通文本段用 insertText 批量发送，换行用 keyDown/keyUp
+      const segments = text.split(/(\n|\r)/);
+      for (const seg of segments) {
+        if (seg === '\n' || seg === '\r') {
+          await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent',
+            { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+          await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent',
+            { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+        } else if (seg.length > 0) {
+          await chrome.debugger.sendCommand({ tabId }, 'Input.insertText', { text: seg });
+        }
       }
-      return ok([{type:'text',text:`Typed ${text.length} chars`}]);
+      return ok([{ type: 'text', text: `Typed ${text.length} chars` }]);
     }
     case 'key': {
       const repeat = Math.min(args.repeat||1,100);
