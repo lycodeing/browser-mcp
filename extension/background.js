@@ -720,6 +720,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       reconnectAttempt,
     });
   }
+  // 立即触发重连：清除待执行的定时器，重置 stopped 标志，发起新连接
+  if (msg.type === 'reconnect') {
+    stopped = false;
+    if (reconnectTimer !== null) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    connect();
+    reply({ ok: true });
+  }
   return false;
 });
 
