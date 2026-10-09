@@ -17,9 +17,9 @@ export function clearExtensionWs(ws) {
   extensionWs = null;
   extensionInfo.version = null;
   extensionInfo.browserType = null;
-  for (const { reject, timer } of pendingRequests.values()) {
+  for (const { reject, timer, tool } of pendingRequests.values()) {
     clearTimeout(timer);
-    reject(new Error('Extension disconnected'));
+    reject(new Error(`Extension disconnected (pending: ${tool})`));
   }
   pendingRequests.clear();
 }

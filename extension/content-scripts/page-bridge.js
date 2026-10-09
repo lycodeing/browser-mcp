@@ -49,13 +49,6 @@
       return s;
     }
 
-    function isInteractive(el) {
-      const tag = el.tagName.toLowerCase();
-      return ['a','button','input','select','textarea','label'].includes(tag) ||
-        el.getAttribute('role') != null || el.getAttribute('tabindex') != null ||
-        el.onclick != null;
-    }
-
     function isVisible(el) {
       const s = getComputedStyle(el);
       if (s.display === 'none' || s.visibility === 'hidden') return false;
@@ -64,10 +57,13 @@
     }
 
     const results = [];
-    const allEls = document.querySelectorAll('*');
+    // 精准选择器直接命中可交互元素，避免全量 DOM 扫描
+    const allEls = document.querySelectorAll(
+      'a, button, input, select, textarea, label, [role], [tabindex]'
+    );
 
     for (const el of allEls) {
-      if (!isInteractive(el) || !isVisible(el)) continue;
+      if (!isVisible(el)) continue;
       const s = score(el);
       if (s > 0) {
         // 使用 accessibility-tree 的 getOrAssignRef 获取稳定 ref，确保 find→click 链路互通

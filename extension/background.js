@@ -18,6 +18,8 @@ const tabEventBuffers = new Map();
 const cdpReady = new Set();
 // tabId -> true  (content scripts injected)
 const csInjected = new Set();
+// tabId -> 'accept' | 'dismiss' | 'manual' (JS dialog policy, set during a tool call)
+const dialogModes = new Map();
 
 // ── WebSocket connection ──────────────────────────────────────────────────────
 function connect() {
@@ -103,8 +105,32 @@ async function ensureCs(tabId) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function tabBuf(tabId) {
-  if (!tabEventBuffers.has(tabId)) tabEventBuffers.set(tabId, { console: [], network: [] });
-  return tabEventBuffers.get(tabId);
+  if (!tabEventBuffers.has(tabId)) tabEventBuffers.set(tabId, { console: [], network: [], dialogs: [] });
+  const buf = tabEventBuffers.get(tabId);
+  if (!buf.dialogs) buf.dialogs = [];
+  return buf;
+}
+
+// ── JS dialog policy ─────────────────────────────────────────────────────────
+// 工具调用期间设置策略（默认 accept 防止弹窗挂死 CDP 会话），manual 时挂起待
+// handle_dialog 显式应答。弹窗事件记录进 tab 缓冲并追加到工具结果。
+
+function setDialogMode(tabId, args) {
+  dialogModes.set(tabId, args?.dialog || 'accept');
+  return Date.now();
+}
+
+function clearDialogMode(tabId) {
+  dialogModes.delete(tabId);
+}
+
+function appendDialogNotes(tabId, sinceTs, result) {
+  if (!result?.content) return result;
+  const notes = (tabBuf(tabId).dialogs || [])
+    .filter(d => d.ts >= sinceTs)
+    .map(d => `dialog[${d.type}] ${d.answered ? 'auto-answered' : 'PENDING (use handle_dialog)'}: "${d.message}"`);
+  if (notes.length) result.content.push({ type: 'text', text: notes.join('\n') });
+  return result;
 }
 
 // ── Tool handlers ─────────────────────────────────────────────────────────────
@@ -133,48 +159,105 @@ function parseMods(s) {
   return m;
 }
 
-const SCREENSHOT_QUALITY = { low:{q:20,max:27000}, medium:{q:40,max:270000}, high:{q:60,max:670000} };
+// 图片 token 只取决于像素数，与字节数无关：输出统一缩放到 CSS 像素尺寸并限制长边，
+// 避免高 DPR 屏返回 2~3 倍像素被模型服务端二次缩小。质量只影响传输体积。
+const SCREENSHOT_QUALITY = { low: 45, medium: 65, high: 85 };
+const DEFAULT_MAX_DIMENSION = 1280;
+const SOURCE_QUALITY = 92;
+const MAX_FULLPAGE_CSS_HEIGHT = 20000;
 
-async function captureScreenshot(tabId, quality = 'low') {
-  const cfg = SCREENSHOT_QUALITY[quality] || SCREENSHOT_QUALITY.low;
+// tabId -> 最近一次视口截图的缩放比（截图像素 / CSS 像素）。
+// 模型按截图像素给出坐标，点击类动作据此换算回页面 CSS 像素。
+const shotScale = new Map();
 
-  // 获取当前视口尺寸，用于判断是否需要缩放
-  const MAX_DIM = 2000;
-  let vpResult;
-  try {
-    [vpResult] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => ({ w: window.innerWidth, h: window.innerHeight }),
-    });
-  } catch { vpResult = null; }
-  const vw = vpResult?.result?.w || 1280;
-  const vh = vpResult?.result?.h || 720;
+async function blobToBase64(blob) {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
 
-  // 计算缩放比：取宽/高超出 2000px 的最小比例
-  const scale = Math.min(1, MAX_DIM / Math.max(vw, vh));
+// basis 为期望输出的基准尺寸（CSS 像素），缺省时以位图自身像素为基准；
+// 长边超过 maxDim 时等比缩小，不放大。
+async function rescaleImage(base64, srcMime, { basis, maxDim, format, quality }) {
+  const src = await (await fetch(`data:${srcMime};base64,${base64}`)).blob();
+  const bmp = await createImageBitmap(src);
+  const bw = basis?.w ?? bmp.width, bh = basis?.h ?? bmp.height;
+  const k = Math.min(1, maxDim / Math.max(bw, bh), bmp.width / bw, bmp.height / bh);
+  const width = Math.max(1, Math.round(bw * k));
+  const height = Math.max(1, Math.round(bh * k));
+  const canvas = new OffscreenCanvas(width, height);
+  const ctx = canvas.getContext('2d');
+  if (format !== 'png') { ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, width, height); }
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(bmp, 0, 0, width, height);
+  bmp.close();
+  const out = await canvas.convertToBlob({
+    type: `image/${format}`,
+    ...(format !== 'png' && { quality: quality / 100 }),
+  });
+  return { data: await blobToBase64(out), width, height };
+}
 
-  let q = cfg.q;
-  let data;
-  const screenshotParams = {
-    format: 'jpeg',
-    quality: q,
-    captureBeyondViewport: false,
+// opts: { quality: preset|1-100, format: 'jpeg'|'webp'|'png', fullPage, maxDimension,
+//         region: 截图坐标系下已换算为 CSS 像素的矩形，输出保留区域原生清晰度 }
+// 返回 scale = 输出像素 / CSS 像素（region 时为 null）
+async function captureScreenshot(tabId, opts = {}) {
+  const format = opts.format || 'jpeg';
+  const quality = typeof opts.quality === 'number'
+    ? opts.quality : (SCREENSHOT_QUALITY[opts.quality] ?? SCREENSHOT_QUALITY.medium);
+  const maxDim = Math.min(opts.maxDimension || DEFAULT_MAX_DIMENSION, 8000);
+  const isRegion = !!opts.region;
+  const fullPage = !!opts.fullPage && !isRegion;
+
+  let clip, cssW, cssH;
+  if (isRegion) {
+    const [x0, y0, x1, y1] = opts.region;
+    clip = { x: Math.min(x0, x1), y: Math.min(y0, y1),
+      width: Math.max(1, Math.abs(x1 - x0)), height: Math.max(1, Math.abs(y1 - y0)), scale: 1 };
+  } else {
+    if (fullPage) {
+      const metrics = await chrome.debugger.sendCommand({ tabId }, 'Page.getLayoutMetrics').catch(() => null);
+      const cs = metrics?.cssContentSize || metrics?.contentSize;
+      cssW = Math.ceil(cs?.width || 1280);
+      cssH = Math.min(Math.ceil(cs?.height || 720), MAX_FULLPAGE_CSS_HEIGHT);
+    } else {
+      let vp;
+      try {
+        [vp] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => ({ w: window.innerWidth, h: window.innerHeight }),
+        });
+      } catch { vp = null; }
+      cssW = vp?.result?.w || 1280;
+      cssH = vp?.result?.h || 720;
+    }
+    // 在浏览器侧先按目标比例缩小再截取，避免高 DPR 下生成巨大位图
+    clip = { x: 0, y: 0, width: cssW, height: cssH, scale: Math.min(1, maxDim / Math.max(cssW, cssH)) };
+  }
+
+  const srcFormat = format === 'png' ? 'png' : 'jpeg';
+  const res = await chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', {
+    format: srcFormat,
+    ...(srcFormat === 'jpeg' && { quality: SOURCE_QUALITY }),
+    captureBeyondViewport: fullPage,
     fromSurface: true,
-    ...(scale < 1 && {
-      clip: { x: 0, y: 0, width: vw, height: vh, scale },
-    }),
-  };
+    clip,
+  });
 
-  do {
-    screenshotParams.quality = q;
-    const res = await chrome.debugger.sendCommand(
-      { tabId }, 'Page.captureScreenshot', screenshotParams
-    );
-    data = res.data;
-    q -= 5;
-  } while (data.length > cfg.max && q >= 5);
+  const { data, width, height } = await rescaleImage(res.data, `image/${srcFormat}`, {
+    basis: isRegion ? null : { w: cssW, h: cssH },
+    maxDim, format, quality,
+  });
+  return { data, width, height, format, fullPage, scale: isRegion ? null : width / cssW };
+}
 
-  return data;
+// 模型基于截图像素给出坐标，换算回页面 CSS 像素；未截图或无缩放时原样返回
+function toCss(tabId, pt) {
+  const s = shotScale.get(tabId) || 1;
+  return s === 1 ? pt : [pt[0] / s, pt[1] / s];
 }
 
 async function getElemCoords(tabId, ref) {
@@ -190,15 +273,29 @@ async function toolComputer(args) {
   const {action, tabId} = args;
   if (!tabId) return err('tabId is required');
   await ensureCdp(tabId);
+  const t0 = setDialogMode(tabId, args);
+  let result;
+  try {
+    result = await computerDispatch(args, tabId, action);
+  } finally {
+    clearDialogMode(tabId);
+  }
+  return appendDialogNotes(tabId, t0, result);
+}
 
+async function computerDispatch(args, tabId, action) {
   switch(action) {
     case 'screenshot': {
       await sleep(50);
-      const data = await captureScreenshot(tabId, args.quality||'low');
-      const [vp] = await chrome.scripting.executeScript({target:{tabId},
-        func:()=>({w:window.innerWidth,h:window.innerHeight})});
-      const {w,h} = vp?.result||{w:1280,h:720};
-      return ok([{type:'text',text:`Screenshot ${w}x${h}`},{type:'image',data,mimeType:'image/jpeg'}]);
+      const { data, width, height, format, fullPage, scale } = await captureScreenshot(tabId, {
+        quality: args.quality, format: args.format,
+        fullPage: args.fullPage, maxDimension: args.maxDimension,
+      });
+      // 全页截图的坐标无法对应视口点击，不更新换算比例
+      if (!fullPage) shotScale.set(tabId, scale);
+      const note = !fullPage && scale < 1
+        ? ` (page scaled ${scale.toFixed(2)}x; pass coordinates in this image's pixels)` : '';
+      return ok([{type:'text',text:`Screenshot ${width}x${height}${note}`},{type:'image',data,mimeType:`image/${format}`}]);
     }
     case 'wait': {
       await sleep(Math.min((args.duration||1),10)*1000);
@@ -208,7 +305,7 @@ async function toolComputer(args) {
       const dir = args.scroll_direction||'down', n = Math.min(args.scroll_amount||3,10)*100;
       const dx = dir==='left'?-n:dir==='right'?n:0;
       const dy = dir==='up'?-n:dir==='down'?n:0;
-      const [cx,cy] = args.coordinate||[640,360];
+      const [cx,cy] = args.coordinate ? toCss(tabId, args.coordinate) : [640,360];
       try {
         await chrome.debugger.sendCommand({tabId},'Input.dispatchMouseEvent',
           {type:'mouseWheel',x:cx,y:cy,deltaX:dx,deltaY:dy});
@@ -271,19 +368,27 @@ async function toolComputer(args) {
         const c = await getElemCoords(tabId,args.ref);
         if (!c) return err(`Element not found: ${args.ref}`);
         x=c.x; y=c.y;
-      } else if (args.coordinate) {[x,y]=args.coordinate;} else return err('coordinate or ref required');
+      } else if (args.coordinate) {[x,y]=toCss(tabId,args.coordinate);} else return err('coordinate or ref required');
       await chrome.debugger.sendCommand({tabId},'Input.dispatchMouseEvent',{type:'mouseMoved',x,y});
-      return ok([{type:'text',text:`Hovered at (${Math.round(x)},${Math.round(y)})`}]);
+      const [lx,ly] = args.coordinate || [x,y];
+      return ok([{type:'text',text:`Hovered at (${Math.round(lx)},${Math.round(ly)})`}]);
     }
     case 'zoom': {
-      const [x0,y0,x1,y1] = args.region||[0,0,100,100];
-      const res = await chrome.debugger.sendCommand({tabId},'Page.captureScreenshot',{
-        format:'jpeg',quality:40,captureBeyondViewport:false,fromSurface:true,
-        clip:{x:Math.min(x0,x1),y:Math.min(y0,y1),width:Math.abs(x1-x0),height:Math.abs(y1-y0),scale:1}});
-      return ok([{type:'text',text:`Zoomed (${x0},${y0})-(${x1},${y1})`},{type:'image',data:res.data,mimeType:'image/jpeg'}]);
+      const region = args.region || [0,0,100,100];
+      const [cx0,cy0] = toCss(tabId, [region[0],region[1]]);
+      const [cx1,cy1] = toCss(tabId, [region[2],region[3]]);
+      const { data, width, height, format } = await captureScreenshot(tabId, {
+        region: [cx0,cy0,cx1,cy1],
+        quality: args.quality ?? 'medium',
+        format: args.format,
+        maxDimension: args.maxDimension,
+      });
+      const [x0,y0,x1,y1] = region;
+      return ok([{type:'text',text:`Zoomed (${x0},${y0})-(${x1},${y1}) → ${width}x${height}`},{type:'image',data,mimeType:`image/${format}`}]);
     }
     case 'left_click_drag': {
-      const [sx,sy]=args.start_coordinate||[0,0], [ex,ey]=args.coordinate||[0,0];
+      const [osx,osy]=args.start_coordinate||[0,0], [oex,oey]=args.coordinate||[0,0];
+      const [sx,sy]=toCss(tabId,[osx,osy]), [ex,ey]=toCss(tabId,[oex,oey]);
       const mods=parseMods(args.modifiers);
       await chrome.debugger.sendCommand({tabId},'Input.dispatchMouseEvent',{type:'mouseMoved',x:sx,y:sy,modifiers:mods});
       await sleep(50);
@@ -292,7 +397,7 @@ async function toolComputer(args) {
       await chrome.debugger.sendCommand({tabId},'Input.dispatchMouseEvent',{type:'mouseMoved',x:ex,y:ey,modifiers:mods});
       await sleep(100);
       await chrome.debugger.sendCommand({tabId},'Input.dispatchMouseEvent',{type:'mouseReleased',x:ex,y:ey,button:'left',clickCount:1,modifiers:mods});
-      return ok([{type:'text',text:`Dragged (${sx},${sy})→(${ex},${ey})`}]);
+      return ok([{type:'text',text:`Dragged (${osx},${osy})→(${oex},${oey})`}]);
     }
     default: { // left_click, right_click, double_click, triple_click
       let x,y;
@@ -301,7 +406,7 @@ async function toolComputer(args) {
         const c = await getElemCoords(tabId,args.ref);
         if (!c) return err(`Element not found: ${args.ref}`);
         x=c.x; y=c.y;
-      } else if (args.coordinate) {[x,y]=args.coordinate;} else return err('coordinate or ref required');
+      } else if (args.coordinate) {[x,y]=toCss(tabId,args.coordinate);} else return err('coordinate or ref required');
       const btn = action==='right_click'?'right':'left';
       const cnt = action==='double_click'?2:action==='triple_click'?3:1;
       const mods = parseMods(args.modifiers);
@@ -311,7 +416,8 @@ async function toolComputer(args) {
       await sleep(50);
       await chrome.debugger.sendCommand({tabId},'Input.dispatchMouseEvent',{type:'mouseReleased',x,y,button:btn,clickCount:cnt,modifiers:mods});
       if (btn==='right') await sleep(300);
-      return ok([{type:'text',text:`${action} at (${Math.round(x)},${Math.round(y)})`}]);
+      const [lx,ly] = args.coordinate || [x,y];
+      return ok([{type:'text',text:`${action} at (${Math.round(lx)},${Math.round(ly)})`}]);
     }
   }
 }
@@ -397,9 +503,20 @@ async function toolFormInput(args) {
   return ok([{type:'text',text:`Set value for ${res.fieldName}`}]);
 }
 async function toolNavigate(args) {
-  const {tabId, url, force=false} = args;
+  const {tabId, url} = args;
   if (!tabId) return err('tabId required');
   if (!url) return err('url required');
+  const t0 = setDialogMode(tabId, args);
+  let result;
+  try {
+    result = await navigateImpl(args);
+  } finally {
+    clearDialogMode(tabId);
+  }
+  return appendDialogNotes(tabId, t0, result);
+}
+
+async function navigateImpl({tabId, url, force=false}) {
 
   const RESTRICTED = /^(chrome|chrome-extension|edge|devtools|about|javascript):/i;
 
@@ -465,7 +582,14 @@ async function toolJavascript(args) {
   try {
     const [r] = await chrome.scripting.executeScript({
       target:{tabId},
-      func:code=>{try{return{ok:true,v:(0,eval)(`(${code})`)}}catch{try{(0,eval)(code);return{ok:true,v:undefined}}catch(e){return{ok:false,e:e.message}}}},
+      func:code=>{
+        // 检测语句关键字开头，跳过 (expr) 表达式尝试，省一次失败 eval
+        const isStmt = /^(const|let|var|function|class|if|for|while|switch|try|throw|return|do|export|import)\b/.test(code.trim());
+        try {
+          if (!isStmt) return {ok:true,v:(0,eval)(`(${code})`)};
+          (0,eval)(code); return {ok:true,v:undefined};
+        } catch(e) { return {ok:false,e:e.message} }
+      },
       args:[text],
     });
     const res = r?.result;
@@ -587,6 +711,7 @@ async function toolResizeWindow(args) {
   if (!winId) { const [win]=await chrome.windows.getAll({populate:false}); winId=win?.id; }
   if (!winId) return err('No window found');
   await chrome.windows.update(winId,{width:w,height:h});
+  if (tabId) shotScale.delete(tabId);
   return ok([{type:'text',text:`Window resized to ${w}x${h}`}]);
 }
 
@@ -644,6 +769,181 @@ async function toolTabsClose(args) {
   return ok([{type:'text',text:`Closed tab [${args.tabId}]`}]);
 }
 
+async function toolWaitFor(args) {
+  const { tabId, condition, text, urlPattern, milliseconds, idleMs=750, timeoutMs=15000 } = args;
+  if (!tabId) return err('tabId required');
+  if (!condition) return err('condition required');
+  const t0 = Date.now();
+  const deadline = t0 + timeoutMs;
+  let lastObserved = '';
+
+  while (Date.now() < deadline) {
+    try {
+      if (condition === 'time') {
+        await sleep(Math.min(milliseconds || 1000, Math.max(deadline - Date.now(), 0)));
+        return ok([{type:'text',text:`Waited ${milliseconds || 1000}ms`}]);
+      }
+      if (condition === 'url') {
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        const url = tab?.url || '';
+        lastObserved = url;
+        if (urlPattern && url.includes(urlPattern))
+          return ok([{type:'text',text:`URL matched after ${Date.now()-t0}ms: ${url}`}]);
+      } else if (condition === 'network_idle') {
+        await ensureCdp(tabId);
+        const reqs = tabBuf(tabId)?.network || [];
+        const last = reqs.length ? reqs[reqs.length-1].timestamp : 0;
+        const quiet = Date.now() - last;
+        lastObserved = `${reqs.length} requests buffered, last ${quiet}ms ago`;
+        if (quiet >= idleMs)
+          return ok([{type:'text',text:`Network idle after ${Date.now()-t0}ms (no new requests for ${quiet}ms)`}]);
+      } else {
+        await ensureCs(tabId);
+        const [r] = await chrome.scripting.executeScript({
+          target:{tabId},
+          func:(q,max)=>{ const b = globalThis.__pageBridge; return b ? b.searchElements(q, max) : []; },
+          args:[text||'', 1],
+        });
+        const found = (r?.result||[]).length > 0;
+        lastObserved = found ? `element "${text}" present` : `element "${text}" absent`;
+        if (condition === 'element' && found)
+          return ok([{type:'text',text:`Element "${text}" appeared after ${Date.now()-t0}ms`}]);
+        if (condition === 'element_gone' && !found)
+          return ok([{type:'text',text:`Element "${text}" gone after ${Date.now()-t0}ms`}]);
+      }
+    } catch (e) {
+      // 页面导航中/CDP 重连中等瞬态错误：记入观察状态继续轮询
+      lastObserved = `probe failed: ${e.message}`;
+    }
+    await sleep(300);
+  }
+  return err(`Timeout after ${timeoutMs}ms waiting for ${condition}. Last state: ${lastObserved}`);
+}
+
+async function toolHandleDialog(args) {
+  const { tabId, accept=true, promptText } = args;
+  if (!tabId) return err('tabId required');
+  await ensureCdp(tabId);
+  const pending = (tabBuf(tabId).dialogs || []).filter(d => !d.answered).pop();
+  if (!pending) return err('No pending dialog on this tab');
+  await chrome.debugger.sendCommand({ tabId }, 'Page.handleJavaScriptDialog',
+    { accept, ...(promptText != null && { promptText }) });
+  pending.answered = true;
+  return ok([{type:'text',text:`Dialog [${pending.type}] ${accept ? 'accepted' : 'dismissed'}: "${pending.message}"`}]);
+}
+
+async function toolSavePdf(args) {
+  const { tabId, saveTo, paperFormat='A4', landscape=false, printBackground=true, scale=1 } = args;
+  if (!tabId) return err('tabId required');
+  if (!saveTo) return err('saveTo required');
+  await ensureCdp(tabId);
+  const res = await chrome.debugger.sendCommand({ tabId }, 'Page.printToPDF', {
+    format: paperFormat, landscape, printBackground, scale,
+    transferMode: 'ReturnAsBase64',
+  });
+  return ok([
+    {type:'text',text:`PDF generated (${paperFormat}${landscape ? ', landscape' : ''})`},
+    {type:'image',data:res.data,mimeType:'application/pdf'},
+  ]);
+}
+
+async function toolCookies(args) {
+  const { action, url, domain, name, cookies } = args;
+  try {
+    if (action === 'get') {
+      if (!url && !domain) return err('url or domain required');
+      const query = { ...(url && { url }), ...(domain && { domain }), ...(name && { name }) };
+      const list = await chrome.cookies.getAll(query);
+      const out = list.slice(0, 200).map(c => ({
+        name: c.name, value: c.value, domain: c.domain, path: c.path,
+        secure: c.secure, httpOnly: c.httpOnly,
+        expires: c.expirationDate ? new Date(c.expirationDate * 1000).toISOString() : 'session',
+      }));
+      return ok([{type:'text',text:`Cookies (${out.length}${list.length > 200 ? ', truncated' : ''}):\n\n${JSON.stringify(out, null, 2)}`}]);
+    }
+    if (action === 'set') {
+      if (!url || !cookies?.length) return err('url and cookies required');
+      const results = [];
+      for (const c of cookies) {
+        try {
+          await chrome.cookies.set({ url, ...(domain && { domain }), ...c });
+          results.push(`ok ${c.name}`);
+        } catch (e) { results.push(`FAIL ${c.name}: ${e.message}`); }
+      }
+      return ok([{type:'text',text:`Set cookies for ${url}:\n${results.join('\n')}`}]);
+    }
+    if (action === 'remove') {
+      if (!url || !name) return err('url and name required');
+      await chrome.cookies.remove({ url, name });
+      return ok([{type:'text',text:`Removed cookie ${name} on ${url}`}]);
+    }
+    // clear：强制带 domain 范围，避免误清全浏览器
+    if (!domain) return err('clear requires a domain (safety: no whole-browser wipe)');
+    const list = await chrome.cookies.getAll({ domain });
+    let removed = 0;
+    for (const c of list) {
+      const scheme = c.secure ? 'https' : 'http';
+      await chrome.cookies.remove({ url: `${scheme}://${c.domain.replace(/^\./, '')}${c.path}`, name: c.name }).catch(() => {});
+      removed++;
+    }
+    return ok([{type:'text',text:`Cleared ${removed} cookies for domain ${domain}`}]);
+  } catch (e) { return err(e.message); }
+}
+
+async function toolDownloads(args) {
+  const { action, urlFilter, downloadId, timeoutMs = 120000 } = args;
+  try {
+    if (action === 'list') {
+      const items = await chrome.downloads.search({ orderBy: ['-startTime'], limit: 500 });
+      const filtered = urlFilter ? items.filter(d => d.url.includes(urlFilter)) : items;
+      const lines = filtered.slice(0, 20).map(d =>
+        `[${d.id}] ${d.state} ${(d.bytesReceived/1024).toFixed(0)}KB/${((d.totalBytes||0)/1024).toFixed(0)}KB\n    ${d.filename}\n    ${d.url}`);
+      return ok([{type:'text',text:`Downloads (${filtered.length}):\n\n${lines.join('\n') || '(none)'}`}]);
+    }
+    if (action === 'wait') {
+      let target = downloadId ?? null;
+      if (!target) {
+        if (!urlFilter) return err('urlFilter or downloadId required');
+        const items = await chrome.downloads.search({ orderBy: ['-startTime'], limit: 500 });
+        const hit = items.find(d => d.url.includes(urlFilter) && d.state === 'in_progress')
+          || items.find(d => d.url.includes(urlFilter));
+        if (!hit) return err(`No download matching "${urlFilter}"`);
+        target = hit.id;
+        if (hit.state === 'complete')
+          return ok([{type:'text',text:`Download ${target} already complete: ${hit.filename}`}]);
+      }
+      const outcome = await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          chrome.downloads.onChanged.removeListener(h);
+          resolve({ timeout: true });
+        }, timeoutMs);
+        function h(delta) {
+          if (delta.id !== target || !delta.state) return;
+          if (delta.state.current === 'complete' || delta.state.current === 'interrupted') {
+            clearTimeout(timer);
+            chrome.downloads.onChanged.removeListener(h);
+            resolve({ state: delta.state.current });
+          }
+        }
+        chrome.downloads.onChanged.addListener(h);
+      });
+      const [item] = await chrome.downloads.search({ id: target });
+      if (!item) return err(`Download ${target} not found`);
+      if (outcome.timeout)
+        return err(`Timeout after ${timeoutMs}ms: state=${item.state}, ${item.bytesReceived}/${item.totalBytes} bytes — ${item.filename}`);
+      if (item.state === 'complete')
+        return ok([{type:'text',text:`Download complete: ${item.filename}\nURL: ${item.url}`}]);
+      return err(`Download ${item.state}: ${item.filename}${item.error ? ` (${item.error})` : ''}`);
+    }
+    // erase：仅清历史记录，不删文件
+    if (!downloadId && !urlFilter) return err('downloadId or urlFilter required');
+    const ids = downloadId ? [downloadId]
+      : (await chrome.downloads.search({ limit: 500 })).filter(d => d.url.includes(urlFilter)).map(d => d.id);
+    for (const id of ids) await chrome.downloads.erase({ id }).catch(() => {});
+    return ok([{type:'text',text:`Erased ${ids.length} download history entries (files kept)`}]);
+  } catch (e) { return err(e.message); }
+}
+
 const TOOL_MAP = {
   computer: toolComputer, read_page: toolReadPage, find: toolFind,
   form_input: toolFormInput, navigate: toolNavigate,
@@ -651,7 +951,12 @@ const TOOL_MAP = {
   file_upload: toolFileUpload, resize_window: toolResizeWindow,
   read_console_messages: toolReadConsole, read_network_requests: toolReadNetwork,
   tabs_context: toolTabsContext, tabs_create: toolTabsCreate, tabs_close: toolTabsClose,
+  wait_for: toolWaitFor, handle_dialog: toolHandleDialog, save_pdf: toolSavePdf,
+  cookies: toolCookies, downloads: toolDownloads,
 };
+
+// wait_for/downloads 的长超时工具放宽 WS 层兜底（relay 侧另有逐工具超时）
+const EXT_TOOL_TIMEOUTS = { wait_for: 135000, downloads: 620000, save_pdf: 70000 };
 
 // ── Response helpers ──────────────────────────────────────────────────────────
 function ok(content) { return { content }; }
@@ -676,7 +981,8 @@ async function handleMessage(raw) {
     try {
       const result = await Promise.race([
         handler(args),
-        new Promise((_,rej)=>setTimeout(()=>rej(new Error(`Tool timeout: ${tool}`)),TOOL_TIMEOUT)),
+        new Promise((_,rej)=>setTimeout(()=>rej(new Error(`Tool timeout: ${tool}`)),
+          EXT_TOOL_TIMEOUTS[tool] ?? TOOL_TIMEOUT)),
       ]);
       sendMsg({id:msg.id, result});
     } catch(e) {
@@ -718,8 +1024,16 @@ chrome.debugger.onEvent.addListener((src, method, params) => {
     if (req) { req.status=params.response?.status||0; req.mimeType=params.response?.mimeType||''; }
   }
 
-  if (method === 'Page.javascriptDialogOpening' && params.type==='alert') {
-    chrome.debugger.sendCommand({tabId},'Page.handleJavaScriptDialog',{accept:true}).catch(()=>{});
+  if (method === 'Page.javascriptDialogOpening') {
+    const dbuf = tabBuf(tabId).dialogs;
+    dbuf.push({ type: params.type, message: params.message || '', ts: Date.now(), answered: false });
+    if (dbuf.length > 20) dbuf.shift();
+    const mode = dialogModes.get(tabId) || 'accept';
+    if (mode !== 'manual') {
+      chrome.debugger.sendCommand({ tabId }, 'Page.handleJavaScriptDialog', { accept: mode === 'accept' }).catch(() => {});
+      const last = dbuf[dbuf.length - 1];
+      if (last && !last.answered) last.answered = true;
+    }
   }
 });
 
@@ -729,6 +1043,7 @@ chrome.debugger.onDetach.addListener(src => {
 
 chrome.tabs.onRemoved.addListener(tabId => {
   tabEventBuffers.delete(tabId);
+  shotScale.delete(tabId);
   cdpReady.delete(tabId);
   csInjected.delete(tabId);
 });

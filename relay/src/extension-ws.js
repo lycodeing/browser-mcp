@@ -32,14 +32,27 @@ export function startExtensionWsServer(port = 16789) {
     // 发送工具列表给扩展（扩展可据此做自检）
     ws.send(JSON.stringify({ method: 'ping' }));
 
+    let pongPending = false;
     const pingTimer = setInterval(() => {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({ method: 'ping' }));
+      if (ws.readyState !== ws.OPEN) return;
+      // 上一轮 ping 仍未收到 pong → 扩展可能卡死，主动终止连接
+      if (pongPending) {
+        console.log('[Relay] Extension pong timeout, terminating connection');
+        ws.terminate();
+        return;
       }
+      ws.send(JSON.stringify({ method: 'ping' }));
+      pongPending = true;
     }, PING_INTERVAL);
 
     ws.on('message', (data) => {
-      handleExtensionMessage(data.toString());
+      const str = data.toString();
+      // pong 在此拦截，重置待定状态；其余消息交给 bridge 处理
+      try {
+        const msg = JSON.parse(str);
+        if (msg.method === 'pong') { pongPending = false; return; }
+      } catch {}
+      handleExtensionMessage(str);
     });
 
     ws.on('close', (code, reason) => {

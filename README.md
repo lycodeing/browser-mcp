@@ -67,6 +67,24 @@ npm start
 }
 ```
 
+#### pi
+
+编辑 `~/.pi/agent/mcp.json`（配合 pi-mcp-extension）：
+
+```json
+{
+  "mcpServers": {
+    "browser": {
+      "transport": "streamable-http",
+      "url": "http://127.0.0.1:3000/mcp",
+      "lifecycle": "eager"
+    }
+  }
+}
+```
+
+pi 无需手动启动 Relay：全局扩展 `~/.pi/agent/extensions/browser-relay-autostart.ts` 会在每次会话启动时检测 `127.0.0.1:3000`，未运行则自动拉起（日志写入 `/tmp/browser-mcp-relay.log`）。
+
 配置后重启 ZCode / Claude Code，工具列表里会出现 `browser__computer`、`browser__navigate` 等工具。
 
 ---
@@ -75,8 +93,8 @@ npm start
 
 | 工具 | 功能 |
 |------|------|
-| `computer` | 截图、点击、拖拽、输入文字、键盘快捷键、滚动、悬停、缩放 |
-| `read_page` | 获取页面无障碍树（元素 ref、role、文本） |
+| `computer` | 截图、点击、拖拽、输入文字、键盘快捷键、滚动、悬停、缩放。截图支持 `format`（jpeg/webp/png）、`fullPage` 全页、`quality` 1-100、`saveTo` 存盘、`maxDimension` 长边上限（默认 1280） |
+| `read_page` | 获取精简无障碍树（仅可见元素，祖先文本不重复；`filter:"interactive"` 只列可交互元素） |
 | `find` | 按关键词搜索页面元素 |
 | `form_input` | 填写表单字段（input / select / textarea） |
 | `navigate` | 跳转 URL，前进/后退，处理 beforeunload |
@@ -89,6 +107,24 @@ npm start
 | `tabs_context` | 列出所有已打开的标签页 |
 | `tabs_create` | 创建新标签页 |
 | `tabs_close` | 关闭指定标签页 |
+| `wait_for` | 等待元素出现/消失、URL 变化、网络空闲或固定时长，替代盲等 |
+| `handle_dialog` | 应答 alert/confirm/prompt（配合 `dialog:"manual"` 使用） |
+| `save_pdf` | 页面导出 PDF 到本地文件（纸张/方向/背景可配） |
+| `cookies` | 读取/注入/删除/清除指定域的 Cookie（登录态管理） |
+| `downloads` | 列出下载、等待完成并返回本地文件路径、清除历史记录 |
+
+> v1.1：`computer` 与 `navigate` 支持 `dialog` 参数（`accept` 默认自动应答 / `dismiss` / `manual`），
+> JS 弹窗不再挂死会话；截图/PDF 产物通过 `saveTo` 落盘，配合 `file_upload` 形成本地文件闭环。
+
+### 图片与 token 优化
+
+图片 token 只取决于像素数，与文件字节数无关，因此优化集中在"少给像素"：
+
+- 截图按 CSS 像素输出并限制长边（默认 1280），高 DPR 屏不再返回 2~3 倍像素。
+- 缩放后点击/拖拽/滚动/zoom 的坐标，直接使用截图里看到的像素，扩展内部自动换算回页面坐标；全页截图不参与换算。
+- `zoom` 按区域从原图裁剪，保留原生清晰度，适合看细节而不必放大整页截图。
+- 单张图片超过约 1 MB（常见于 png / fullPage）时，relay 自动存到系统临时目录 `browser-mcp/`，只返回路径。
+- 优先用 `find` / `read_page` 定位元素，用 `ref` 点击；截图只在需要视觉确认时调用。
 
 ## 典型工作流
 
@@ -100,7 +136,7 @@ tabs_context → 拿到 tabId
 navigate { tabId, url: "https://example.com" }
 
 # 3. 截图看一下当前状态
-computer { action: "screenshot", tabId, quality: "low" }
+computer { action: "screenshot", tabId }
 
 # 4. 找到要操作的元素
 find { tabId, query: "Submit" }  →  拿到 ref
