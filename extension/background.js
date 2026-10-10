@@ -944,7 +944,236 @@ async function toolDownloads(args) {
   } catch (e) { return err(e.message); }
 }
 
+// ── performance / emulate ─────────────────────────────────────────────────────
+// tabId -> { events, truncated, resolve }  (Tracing.* 事件由 chrome.debugger.onEvent 填充)
+const traceSessions = new Map();
+// 设置过 emulate 覆盖的标签页：导航时不能 detach，否则覆盖随调试会话一起丢失
+const emulatedTabs = new Set();
+const MAX_TRACE_EVENTS = 600000;
+const TRACE_CATEGORIES = [
+  'devtools.timeline', 'disabled-by-default-devtools.timeline', 'loading',
+  'v8.execute', 'blink.user_timing',
+];
+
+const NETWORK_PRESETS = {
+  'Offline': { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 },
+  'Slow 3G': { offline: false, latency: 2000, downloadThroughput: 50000, uploadThroughput: 50000 },
+  'Fast 3G': { offline: false, latency: 562, downloadThroughput: 180000, uploadThroughput: 84375 },
+  'Fast 4G': { offline: false, latency: 165, downloadThroughput: 1012500, uploadThroughput: 168750 },
+  'none': { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 },
+};
+
+const PAGE_VITALS_EXPR = `(async () => {
+  const out = {};
+  const nav = performance.getEntriesByType('navigation')[0];
+  if (nav) out.nav = { ttfb: Math.round(nav.responseStart), dcl: Math.round(nav.domContentLoadedEventEnd),
+    load: Math.round(nav.loadEventEnd), transferKB: Math.round(nav.transferSize / 1024) };
+  const fcp = performance.getEntriesByName('first-contentful-paint')[0];
+  if (fcp) out.fcp = Math.round(fcp.startTime);
+  let lcp = null, cur = 0, curStart = 0, curLast = 0, cls = 0, inp = 0;
+  const observers = [];
+  const watch = (type, cb, extra) => {
+    try {
+      const o = new PerformanceObserver(l => l.getEntries().forEach(cb));
+      o.observe({ type, buffered: true, ...extra });
+      observers.push(o);
+    } catch {}
+  };
+  watch('largest-contentful-paint', e => { lcp = e; });
+  watch('layout-shift', e => {
+    if (e.hadRecentInput) return;
+    if (cur && e.startTime - curLast < 1000 && e.startTime - curStart < 5000) cur += e.value;
+    else { cur = e.value; curStart = e.startTime; }
+    curLast = e.startTime;
+    cls = Math.max(cls, cur);
+  });
+  watch('event', e => { if (e.interactionId) inp = Math.max(inp, e.duration); }, { durationThreshold: 16 });
+  await new Promise(r => setTimeout(r, 100));
+  observers.forEach(o => o.disconnect());
+  if (lcp) out.lcp = { time: Math.round(lcp.startTime), size: lcp.size,
+    el: lcp.element ? lcp.element.tagName.toLowerCase() : null, url: lcp.url || null };
+  out.cls = Math.round(cls * 1000) / 1000;
+  out.inp = inp ? Math.round(inp) : null;
+  const res = performance.getEntriesByType('resource');
+  out.resources = { count: res.length, transferKB: Math.round(res.reduce((s, r) => s + (r.transferSize || 0), 0) / 1024),
+    slowest: res.slice().sort((a, b) => b.duration - a.duration).slice(0, 5)
+      .map(r => ({ url: r.name.slice(0, 120), ms: Math.round(r.duration) })) };
+  out.domNodes = document.getElementsByTagName('*').length;
+  return JSON.stringify(out);
+})()`;
+
+async function perfMetrics(tabId) {
+  await ensureCdp(tabId);
+  const ev = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate',
+    { expression: PAGE_VITALS_EXPR, awaitPromise: true, returnByValue: true });
+  if (ev.exceptionDetails) return err(ev.exceptionDetails.exception?.description || 'vitals script failed');
+  const v = JSON.parse(ev.result.value);
+
+  await chrome.debugger.sendCommand({ tabId }, 'Performance.enable');
+  let cdp = {};
+  try {
+    const { metrics } = await chrome.debugger.sendCommand({ tabId }, 'Performance.getMetrics');
+    for (const m of metrics) cdp[m.name] = m.value;
+  } finally {
+    await chrome.debugger.sendCommand({ tabId }, 'Performance.disable').catch(() => {});
+  }
+  const mb = (n) => n == null ? 'n/a' : `${(n / 1048576).toFixed(1)} MB`;
+  const ms = (s) => s == null ? 'n/a' : `${Math.round(s * 1000)} ms`;
+
+  const lines = [
+    'Core Web Vitals (current page lifetime; INP is the worst observed interaction, approximate)',
+    `  LCP: ${v.lcp ? `${v.lcp.time} ms (${v.lcp.el || 'unknown'}, size ${v.lcp.size}${v.lcp.url ? `, ${v.lcp.url.slice(0, 80)}` : ''})` : 'not observed'}`,
+    `  CLS: ${v.cls}`,
+    `  INP: ${v.inp != null ? `${v.inp} ms` : 'no interactions yet'}`,
+    `  FCP: ${v.fcp != null ? `${v.fcp} ms` : 'n/a'}`,
+  ];
+  if (v.nav) lines.push('Navigation', `  TTFB ${v.nav.ttfb} ms · DOMContentLoaded ${v.nav.dcl} ms · load ${v.nav.load} ms · document ${v.nav.transferKB} KB`);
+  lines.push(
+    'Runtime (CDP Performance.getMetrics)',
+    `  JS heap ${mb(cdp.JSHeapUsedSize)} used / ${mb(cdp.JSHeapTotalSize)} total · DOM nodes ${v.domNodes} · listeners ${cdp.JSEventListeners ?? 'n/a'} · documents ${cdp.Documents ?? 'n/a'} · frames ${cdp.Frames ?? 'n/a'}`,
+    `Resources: ${v.resources.count} requests, ${v.resources.transferKB} KB transferred (cross-origin/cached entries report 0, so this is a lower bound)`,
+    'Slowest resources:',
+    ...v.resources.slowest.map(r => `  ${r.ms} ms  ${r.url}`),
+  );
+  return ok([{ type: 'text', text: lines.join('\n') }]);
+}
+
+const SCRIPT_EVENTS = new Set(['EvaluateScript', 'v8.compile', 'v8.compileModule', 'FunctionCall',
+  'v8.callFunction', 'v8.run', 'TimerFire', 'EventDispatch', 'FireAnimationFrame', 'RunMicrotasks', 'XHRReadyStateChange']);
+const LAYOUT_EVENTS = new Set(['UpdateLayoutTree', 'Layout']);
+const PAINT_EVENTS = new Set(['Paint', 'PrePaint', 'Layerize', 'Commit', 'UpdateLayer', 'CompositeLayers', 'HitTest']);
+
+function analyzeTrace(events, truncated) {
+  const started = events.find(e => e.name === 'TracingStartedInBrowser');
+  const frames = started?.args?.data?.frames || [];
+  const mainFrame = frames.find(f => f.isInPrimaryMainFrame) || frames.find(f => !f.parent) || frames[0];
+  const mainThreads = events.filter(e => e.ph === 'M' && e.name === 'thread_name' && e.args?.name === 'CrRendererMain');
+  const main = mainThreads.find(e => e.pid === mainFrame?.processId) || mainThreads[0];
+  if (!main) return null;
+
+  const mine = events.filter(e => e.pid === main.pid);
+  const navStart = mine.filter(e => e.name === 'navigationStart' && e.args?.data?.isLoadingMainFrame).pop();
+  const t0 = (navStart ?? started)?.ts ?? mine.reduce((m, e) => e.ts && e.ts < m ? e.ts : m, Infinity);
+  const rel = (ts) => Math.round((ts - t0) / 1000);
+
+  const fcp = mine.find(e => e.name === 'firstContentfulPaint' && e.ts >= t0);
+  const lcp = mine.filter(e => e.name === 'largestContentfulPaint::Candidate' && e.ts >= t0).pop();
+  const cls = mine.filter(e => e.name === 'LayoutShift' && e.args?.data?.is_main_frame && !e.args?.data?.had_recent_input)
+    .reduce((s, e) => s + (e.args.data.score || 0), 0);
+
+  const sorted = mine.filter(e => e.tid === main.tid && e.ph === 'X' && e.dur != null)
+    .sort((a, b) => a.ts - b.ts || b.dur - a.dur);
+  const stack = [], nodes = [];
+  for (const e of sorted) {
+    while (stack.length && stack[stack.length - 1].end <= e.ts) stack.pop();
+    const node = { e, end: e.ts + e.dur, child: 0 };
+    if (stack.length) stack[stack.length - 1].child += e.dur;
+    stack.push(node); nodes.push(node);
+  }
+  const buckets = { scripting: 0, layout: 0, paint: 0, parsing: 0, other: 0 };
+  for (const { e, child } of nodes) {
+    const self = e.dur - child;
+    if (SCRIPT_EVENTS.has(e.name)) buckets.scripting += self;
+    else if (LAYOUT_EVENTS.has(e.name)) buckets.layout += self;
+    else if (PAINT_EVENTS.has(e.name)) buckets.paint += self;
+    else if (e.name === 'ParseHTML') buckets.parsing += self;
+    else buckets.other += self;
+  }
+  const tasks = nodes.filter(n => n.e.name === 'RunTask' && n.e.dur >= 50000);
+  const afterFcp = fcp ? tasks.filter(n => n.e.ts >= fcp.ts) : tasks;
+  const blocking = afterFcp.reduce((s, n) => s + (n.e.dur - 50000), 0);
+  const topScripts = nodes.filter(n => n.e.name === 'EvaluateScript' || n.e.name === 'FunctionCall')
+    .sort((a, b) => b.e.dur - a.e.dur).slice(0, 5);
+
+  const f = (us) => `${Math.round(us / 1000)} ms`;
+  const lines = [
+    `Trace summary (main frame renderer pid ${main.pid}${truncated ? ', TRUNCATED at event cap' : ''})`,
+    navStart ? 'Window: from main-frame navigation start' : 'Window: from trace start (no navigation recorded; use reload:true for load metrics)',
+    `  FCP: ${fcp ? `${rel(fcp.ts)} ms` : 'not observed'}`,
+    `  LCP: ${lcp ? `${rel(lcp.ts)} ms (${lcp.args?.data?.type || 'unknown'}, size ${lcp.args?.data?.size ?? 'n/a'})` : 'not observed'}`,
+    `  CLS: ${Math.round(cls * 1000) / 1000}`,
+    `  Blocking time (long-task excess over 50 ms${fcp ? ', after FCP' : ''}): ${f(blocking)}`,
+    `Main thread self time: scripting ${f(buckets.scripting)} · layout/style ${f(buckets.layout)} · paint ${f(buckets.paint)} · parsing ${f(buckets.parsing)} · other ${f(buckets.other)}`,
+    `Long tasks (>=50 ms): ${tasks.length}`,
+    ...tasks.sort((a, b) => b.e.dur - a.e.dur).slice(0, 8).map(n => `  ${f(n.e.dur)} at +${rel(n.e.ts)} ms`),
+    'Heaviest script calls:',
+    ...topScripts.map(({ e }) => {
+      const d = e.args?.data || {};
+      const where = d.url ? `${d.url.slice(0, 90)}${d.lineNumber != null ? `:${d.lineNumber}` : ''}` : (d.functionName || '(anonymous)');
+      return `  ${f(e.dur)}  ${e.name}  ${where}`;
+    }),
+  ];
+  return lines.join('\n');
+}
+
+async function toolPerformance(args) {
+  const { tabId, action, reload = false } = args;
+  if (!tabId) return err('tabId required');
+  try {
+    if (action === 'metrics') return await perfMetrics(tabId);
+
+    if (action === 'trace_start') {
+      if (traceSessions.has(tabId)) return err('A trace is already running on this tab; call trace_stop first');
+      await ensureCdp(tabId);
+      const session = { events: [], truncated: false, resolve: null };
+      traceSessions.set(tabId, session);
+      try {
+        await chrome.debugger.sendCommand({ tabId }, 'Tracing.start', {
+          traceConfig: { recordMode: 'recordAsMuchAsPossible', includedCategories: TRACE_CATEGORIES },
+        });
+        if (reload) await chrome.debugger.sendCommand({ tabId }, 'Page.reload', { ignoreCache: true });
+      } catch (e) { traceSessions.delete(tabId); throw e; }
+      return ok([{ type: 'text', text: `Trace started${reload ? ' (page reloading)' : ''}. Interact with the page, then call performance with action "trace_stop".` }]);
+    }
+
+    if (action === 'trace_stop') {
+      const session = traceSessions.get(tabId);
+      if (!session) return err('No trace running on this tab; call trace_start first');
+      const done = new Promise(r => { session.resolve = r; });
+      try { await chrome.debugger.sendCommand({ tabId }, 'Tracing.end'); }
+      catch (e) { traceSessions.delete(tabId); throw e; }
+      const finished = await Promise.race([done.then(() => true), sleep(40000).then(() => false)]);
+      traceSessions.delete(tabId);
+      const summary = analyzeTrace(session.events, session.truncated);
+      if (!summary) return err('Trace contained no renderer main-thread events for this tab');
+      return ok([{ type: 'text', text: summary + (finished ? '' : '\n(trace flush timed out; results may be partial)') }]);
+    }
+    return err(`Unknown action: ${action}`);
+  } catch (e) { return err(e.message); }
+}
+
+async function toolEmulate(args) {
+  const { tabId, cpuThrottlingRate, networkConditions, colorScheme, userAgent, reset = false } = args;
+  if (!tabId) return err('tabId required');
+  try {
+    await ensureCdp(tabId);
+    const send = (m, p) => chrome.debugger.sendCommand({ tabId }, m, p);
+    const applied = [];
+    const cpu = reset ? 1 : cpuThrottlingRate;
+    const net = reset ? 'none' : networkConditions;
+    const scheme = reset ? 'auto' : colorScheme;
+    const ua = reset ? '' : userAgent;
+
+    if (cpu != null) { await send('Emulation.setCPUThrottlingRate', { rate: cpu }); applied.push(`CPU throttling ${cpu}x`); }
+    if (net != null) {
+      const preset = NETWORK_PRESETS[net];
+      if (!preset) return err(`Unknown networkConditions: ${net}`);
+      await send('Network.emulateNetworkConditions', preset);
+      applied.push(`network ${net}`);
+    }
+    if (scheme != null) {
+      await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: scheme === 'auto' ? '' : scheme }] });
+      applied.push(`color scheme ${scheme}`);
+    }
+    if (ua != null) { await send('Emulation.setUserAgentOverride', { userAgent: ua }); applied.push(ua ? 'user agent override' : 'user agent reset'); }
+    if (!applied.length) return err('Nothing to apply: pass cpuThrottlingRate, networkConditions, colorScheme, userAgent or reset');
+    if (reset) emulatedTabs.delete(tabId); else emulatedTabs.add(tabId);
+    return ok([{ type: 'text', text: `Emulation applied: ${applied.join(', ')}. Overrides last until the debugger detaches (tab closed or DevTools opened) or reset:true.` }]);
+  } catch (e) { return err(e.message); }
+}
+
 const TOOL_MAP = {
+  performance: toolPerformance, emulate: toolEmulate,
   computer: toolComputer, read_page: toolReadPage, find: toolFind,
   form_input: toolFormInput, navigate: toolNavigate,
   javascript_tool: toolJavascript, get_page_text: toolGetPageText,
@@ -956,7 +1185,7 @@ const TOOL_MAP = {
 };
 
 // wait_for/downloads 的长超时工具放宽 WS 层兜底（relay 侧另有逐工具超时）
-const EXT_TOOL_TIMEOUTS = { wait_for: 135000, downloads: 620000, save_pdf: 70000 };
+const EXT_TOOL_TIMEOUTS = { wait_for: 135000, downloads: 620000, save_pdf: 70000, performance: 70000 };
 
 // ── Response helpers ──────────────────────────────────────────────────────────
 function ok(content) { return { content }; }
@@ -994,6 +1223,17 @@ async function handleMessage(raw) {
 // ── Chrome event listeners ────────────────────────────────────────────────────
 chrome.debugger.onEvent.addListener((src, method, params) => {
   const tabId = src.tabId; if (!tabId) return;
+  if (method.startsWith('Tracing.')) {
+    const trace = traceSessions.get(tabId);
+    if (!trace) return;
+    if (method === 'Tracing.dataCollected') {
+      for (const ev of params.value || []) {
+        if (trace.events.length >= MAX_TRACE_EVENTS) { trace.truncated = true; break; }
+        trace.events.push(ev);
+      }
+    } else if (method === 'Tracing.tracingComplete') trace.resolve?.();
+    return;
+  }
   const buf = tabBuf(tabId);
 
   if (method === 'Runtime.consoleAPICalled') {
@@ -1038,10 +1278,12 @@ chrome.debugger.onEvent.addListener((src, method, params) => {
 });
 
 chrome.debugger.onDetach.addListener(src => {
-  if (src.tabId) cdpReady.delete(src.tabId);
+  if (src.tabId) { cdpReady.delete(src.tabId); traceSessions.delete(src.tabId); emulatedTabs.delete(src.tabId); }
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {
+  traceSessions.delete(tabId);
+  emulatedTabs.delete(tabId);
   tabEventBuffers.delete(tabId);
   shotScale.delete(tabId);
   cdpReady.delete(tabId);
@@ -1051,6 +1293,8 @@ chrome.tabs.onRemoved.addListener(tabId => {
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.status === 'loading') {
     csInjected.delete(tabId);
+    // trace 与 emulate 覆盖依赖同一个调试会话，加载期间不能断开，否则 reload 压测会丢数据
+    if (traceSessions.has(tabId) || emulatedTabs.has(tabId)) return;
     // 页面开始加载时 CDP 会话失效，需重新附加
     cdpDetach(tabId).catch(() => {});
   }

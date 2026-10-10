@@ -154,6 +154,19 @@ const SCHEMAS = {
     timeoutMs: z.number().min(1000).max(600000).optional().default(120000)
       .describe('wait: give up if not complete'),
   },
+  performance: {
+    tabId: z.number().describe('Target tab ID'),
+    action: z.enum(['metrics', 'trace_start', 'trace_stop']).describe('metrics: instant snapshot; trace_start/trace_stop: record a trace and get an analysed summary'),
+    reload: z.boolean().optional().default(false).describe('trace_start: reload the page (cache bypassed) once tracing begins, to capture load metrics'),
+  },
+  emulate: {
+    tabId: z.number().describe('Target tab ID'),
+    cpuThrottlingRate: z.number().min(1).max(20).optional().describe('CPU slowdown factor, 1 = off'),
+    networkConditions: z.enum(['Offline', 'Slow 3G', 'Fast 3G', 'Fast 4G', 'none']).optional().describe('Network throttling preset, none = off'),
+    colorScheme: z.enum(['dark', 'light', 'auto']).optional().describe('prefers-color-scheme override, auto = reset'),
+    userAgent: z.string().optional().describe('User agent override, empty string = reset'),
+    reset: z.boolean().optional().default(false).describe('Clear all of the overrides above'),
+  },
 };
 
 // ─── Tool descriptions ────────────────────────────────────────────────────────
@@ -178,6 +191,8 @@ const DESCRIPTIONS = {
   save_pdf: 'Save the page as PDF to a local file via CDP printToPDF.',
   cookies: 'Read, set, remove, or clear browser cookies for a domain/URL (login-state management).',
   downloads: 'List downloads, wait for a download to complete and get its local path, or erase history entries.',
+  performance: 'Inspect page performance. "metrics" returns an instant snapshot (LCP, CLS, INP, FCP, TTFB, JS heap, DOM nodes, listeners, slowest resources). "trace_start" then "trace_stop" records a Chrome trace and returns a summary (long tasks, blocking time, main-thread breakdown, heaviest scripts); use reload:true on trace_start to capture page load. Combine with emulate to test under throttling.',
+  emulate: 'Throttle CPU or network, override color scheme or user agent for a tab (CDP emulation). Overrides stay until reset:true or the debugger detaches.',
 };
 
 // ─── Per-tool timeout (ms) ────────────────────────────────────────────────────
@@ -190,6 +205,7 @@ const TOOL_TIMEOUTS = {
   navigate: 30000, computer: 30000, javascript_tool: 30000, file_upload: 30000,
   wait_for: 130000, handle_dialog: 5000, save_pdf: 60000,
   cookies: 10000, downloads: 610000,
+  performance: 60000, emulate: 10000,
 };
 
 // ─── Build a fresh McpServer with all tools registered ──────────────────────────

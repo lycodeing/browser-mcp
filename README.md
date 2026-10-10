@@ -112,6 +112,8 @@ pi 无需手动启动 Relay：全局扩展 `~/.pi/agent/extensions/browser-relay
 | `save_pdf` | 页面导出 PDF 到本地文件（纸张/方向/背景可配） |
 | `cookies` | 读取/注入/删除/清除指定域的 Cookie（登录态管理） |
 | `downloads` | 列出下载、等待完成并返回本地文件路径、清除历史记录 |
+| `performance` | `metrics` 即时读取 LCP/CLS/INP/FCP/TTFB、JS 堆、DOM 节点数、监听器数、最慢资源；`trace_start` / `trace_stop` 录制 Chrome trace 并返回摘要（长任务、阻塞时间、主线程耗时分布、最重脚本），`reload:true` 可抓加载过程 |
+| `emulate` | CPU 降速、网络限速（Slow 3G / Fast 3G / Fast 4G / Offline）、深浅色模式、User-Agent 覆盖，`reset:true` 还原；配合 `performance` 做弱网/低端设备测试 |
 
 > v1.1：`computer` 与 `navigate` 支持 `dialog` 参数（`accept` 默认自动应答 / `dismiss` / `manual`），
 > JS 弹窗不再挂死会话；截图/PDF 产物通过 `saveTo` 落盘，配合 `file_upload` 形成本地文件闭环。

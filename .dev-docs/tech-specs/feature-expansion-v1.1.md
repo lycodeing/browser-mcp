@@ -346,6 +346,21 @@ downloads: {
 TOOL_TIMEOUTS.downloads = list/erase 10000，wait 由参数上限决定（610000 上限内取
 timeoutMs + 10s）。relay 的 TOOL_TIMEOUTS 对该工具设 610000。
 
+## 9.1 性能与模拟（新工具 performance / emulate）
+
+参考 chrome-devtools-mcp 的 performance_* 与 emulate 工具，合并为两个工具，沿用现有 CDP 会话，不新增权限与依赖。
+
+**performance**（`tabId`、`action: metrics | trace_start | trace_stop`、`reload`）：
+
+- metrics：页面内用 PerformanceObserver（buffered）读 LCP / CLS（session window）/ INP（近似，取最差交互）/ FCP / 导航计时 / 资源统计，再叠加 CDP `Performance.getMetrics`（JS 堆、监听器数、文档/frame 数）。脚本、布局、任务等耗时指标在 `Performance.enable` 之后才开始累计，即用即关地读取恒为 0，所以 metrics 不输出它们，CPU 耗时分析交给 trace。
+- trace_start：`Tracing.start`（categories：devtools.timeline、loading、v8.execute、blink.user_timing），按 tabId 缓冲 `Tracing.dataCollected`，上限 600000 条事件；`reload:true` 时在开始后 `Page.reload`（忽略缓存）。
+- trace_stop：`Tracing.end`，等待 `Tracing.tracingComplete`（40s 兜底），解析出 FCP / LCP / CLS、50ms 以上长任务、阻塞时间、主线程 self time 分类（scripting/layout/paint/parsing/other）和最重的脚本调用。返回摘要文本，不返回原始 trace。
+- 清理：调试器断开或标签页关闭时丢弃该 tab 的 trace 缓冲；trace 进行中不因页面加载而 detach CDP。
+
+**emulate**（`cpuThrottlingRate`、`networkConditions`、`colorScheme`、`userAgent`、`reset`）：分别对应 `Emulation.setCPUThrottlingRate`、`Network.emulateNetworkConditions`、`Emulation.setEmulatedMedia`、`Emulation.setUserAgentOverride`。覆盖保持到 `reset:true` 或调试器断开；有覆盖的标签页加载时不主动 detach。
+
+超时：relay 侧 performance 60000、emulate 10000；扩展侧 performance 70000。
+
 ## 10. 权限与版本
 
 ### manifest.json 变更
