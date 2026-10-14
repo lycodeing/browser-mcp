@@ -193,3 +193,7 @@ browser-mcp/
         ├── accessibility-tree.js  # 页面元素树
         └── page-bridge.js         # 文本提取 & 元素搜索
 ```
+
+## 许可证
+
+[MIT](LICENSE)
