@@ -1,60 +1,138 @@
+<div align="center">
+
+<img src="extension/icons/icon128.png" width="96" alt="browser-mcp logo" />
+
 # browser-mcp
 
-Chrome 浏览器自动化 MCP 工具，让 ZCode / Claude Code 可以直接操控浏览器。
+**让 AI 助手直接操控你正在用的 Chrome。**
 
-## 架构
+一个 Chrome 扩展 + 本地 MCP Relay，把浏览器能力以 21 个工具的形式提供给 ZCode、Claude Code、pi 等任何支持 MCP 的客户端。
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white)
+![Chrome MV3](https://img.shields.io/badge/Chrome-Manifest%20V3-4285F4?logo=googlechrome&logoColor=white)
+![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-8A2BE2)
+![Tools](https://img.shields.io/badge/tools-21-orange)
+
+[GitHub](https://github.com/lycodeing/browser-mcp) · [Gitee 镜像](https://gitee.com/lycodeing/browser-mcp)
+
+</div>
+
+---
+
+## 为什么用它
+
+- **用的是你自己的浏览器**：直接操作已登录的 Chrome，保留登录态、扩展和书签，不用另起一个无头浏览器，也不用重新登录。
+- **一个端点，所有客户端**：标准 MCP Streamable HTTP，装一次，ZCode / Claude Code / pi 共用同一个 `http://127.0.0.1:3000/mcp`。
+- **省 token**：截图按 CSS 像素输出并限制长边，页面树只保留可见元素，超大图片自动落盘只回传路径。
+- **不容易卡死**：JS 弹窗自动应答，扩展断线后按递增间隔自动重连，CDP 暂时拒绝时自动重试。
+- **宽松入参**：模型把数字、布尔、坐标写成字符串（`"123"`、`"[601, 385]"`）也能正常调用。
+- **多 agent 并发**：多个 agent 同时操作不同标签页互不干扰。
+
+## 工作原理
 
 ```
-Chrome 扩展  ──WebSocket──▶  Node.js Relay  ──MCP HTTP──▶  ZCode / Claude Code
-             ws://127.0.0.1:16789           http://127.0.0.1:3000/mcp
+┌──────────────┐  MCP over HTTP   ┌───────────────┐   WebSocket    ┌────────────────────┐
+│ ZCode        │ ───────────────▶ │               │ ─────────────▶ │  Chrome 扩展 (MV3)  │
+│ Claude Code  │  127.0.0.1:3000  │  Node.js      │ 127.0.0.1:16789│  ├ chrome.debugger  │
+│ pi / 其他    │ ◀─────────────── │  Relay        │ ◀───────────── │  ├ chrome.scripting │
+└──────────────┘                  └───────────────┘                │  └ 内容脚本          │
+                                                                   └────────────────────┘
 ```
+
+Relay 对 AI 一侧暴露 MCP 端点，对浏览器一侧运行 WebSocket 服务。扩展主动连上 Relay，通过 Chrome DevTools Protocol 和 `chrome.scripting` 完成截图、点击、输入、读取页面等操作。
+
+## 功能一览
+
+21 个工具，按用途分四组。
+
+### 页面交互与读取
+
+| 工具 | 功能 |
+|------|------|
+| `computer` | 截图、点击（左/右/双击/三击）、拖拽、输入文字、按键、滚动、悬停、区域缩放。支持 `ref` 或坐标定位 |
+| `read_page` | 精简无障碍树，只含可见元素；`filter:"interactive"` 仅列可交互元素 |
+| `find` | 按关键词搜索页面元素，返回可直接点击的 `ref` |
+| `form_input` | 填写 input / select / textarea / contenteditable |
+| `navigate` | 跳转 URL、前进后退、处理 `beforeunload` |
+| `get_page_text` | 提取页面正文纯文本 |
+| `file_upload` | 把本地文件上传到页面的文件选择器 |
+| `wait_for` | 等待元素出现或消失、URL 变化、网络空闲或固定时长，替代盲等 |
+| `handle_dialog` | 应答 alert / confirm / prompt，配合 `dialog:"manual"` 使用 |
+
+### 标签页与窗口
+
+| 工具 | 功能 |
+|------|------|
+| `tabs_context` | 列出所有已打开的标签页 |
+| `tabs_create` | 新建标签页 |
+| `tabs_close` | 关闭标签页 |
+| `resize_window` | 调整浏览器窗口大小 |
+
+### 调试与观测
+
+| 工具 | 功能 |
+|------|------|
+| `javascript_tool` | 在页面上下文中执行 JavaScript |
+| `read_console_messages` | 读取控制台日志缓冲，可按正则和级别过滤 |
+| `read_network_requests` | 读取网络请求缓冲，可按 URL 过滤 |
+| `performance` | `metrics` 即时读取 LCP / CLS / INP / FCP / TTFB、JS 堆、DOM 节点数、监听器数、最慢资源；`trace_start` / `trace_stop` 录制 Chrome trace，返回长任务、阻塞时间、主线程耗时分布和最重脚本 |
+| `emulate` | CPU 降速、网络限速（Slow 3G / Fast 3G / Fast 4G / Offline）、深浅色模式、User-Agent 覆盖，`reset:true` 还原 |
+
+### 数据与产物
+
+| 工具 | 功能 |
+|------|------|
+| `save_pdf` | 页面导出 PDF 到本地，纸张、方向、背景可配 |
+| `cookies` | 读取、注入、删除、清除指定域的 Cookie |
+| `downloads` | 列出下载，等待完成并返回本地文件路径，清除历史 |
+
+### 截图与 token 优化
+
+图片 token 只取决于像素数，与文件字节数无关，所以优化集中在"少给像素"：
+
+- 截图按 CSS 像素输出，长边默认限制为 1280（`maxDimension` 可调），高 DPR 屏不再返回 2 到 3 倍像素。
+- 缩放后点击、拖拽、滚动、`zoom` 的坐标，直接用截图里看到的像素，扩展内部会换算回页面坐标。全页截图不参与换算。
+- `zoom` 从原图裁剪指定区域，保留原生清晰度，看细节不必放大整页。
+- 单张图片超过约 1 MB（常见于 png 或 `fullPage`）时，Relay 自动存到系统临时目录的 `browser-mcp/` 下，只返回路径。也可以用 `saveTo` 指定落盘位置。
+- 优先用 `find` / `read_page` 拿到 `ref` 再点击，截图只在需要视觉确认时调用。
 
 ## 快速开始
+
+**环境要求**：Node.js 18+（开发环境为 22）、Chrome 或其他 Chromium 内核浏览器。
 
 ### 1. 启动 Relay
 
 ```bash
-cd relay
+git clone https://github.com/lycodeing/browser-mcp.git
+cd browser-mcp/relay
 npm install
 npm start
 ```
 
-启动后输出：
+看到下面的输出就说明启动成功：
+
 ```
-[Relay] Extension WS server listening on ws://127.0.0.1:16789
-[Relay] MCP HTTP server listening on http://127.0.0.1:3000/mcp
+[Relay] browser-mcp relay started
+  Extension WS : ws://127.0.0.1:16789
+  MCP endpoint : http://127.0.0.1:3000/mcp
 ```
 
 ### 2. 安装 Chrome 扩展
 
-1. 打开 Chrome，地址栏输入 `chrome://extensions`
+1. 打开 `chrome://extensions`
 2. 右上角开启 **开发者模式**
-3. 点击 **加载已解压的扩展程序**
-4. 选择本项目的 `extension/` 目录
-5. 扩展图标出现后点击，状态显示 **Connected** 即成功
+3. 点击 **加载已解压的扩展程序**，选择本项目的 `extension/` 目录
+4. 点击工具栏里的扩展图标，状态显示 **Connected** 即成功
 
-> 扩展会自动连接本地 Relay，无需额外配置。Relay 必须先于扩展安装前启动。
+扩展会自动连接本地 Relay，断线后按 1s、2s、5s、10s、30s 的间隔重试，所以先装扩展还是先启动 Relay 都可以。
 
-### 3. 配置 ZCode / Claude Code
+### 3. 配置 MCP 客户端
 
-#### ZCode
+<details open>
+<summary><b>ZCode</b></summary>
 
-编辑 `~/.zcode/config.json`（或在 ZCode 设置界面的 MCP 配置区域添加）：
-
-```json
-{
-  "mcpServers": {
-    "browser": {
-      "type": "http",
-      "url": "http://127.0.0.1:3000/mcp"
-    }
-  }
-}
-```
-
-#### Claude Code
-
-编辑 `~/.claude/claude_desktop_config.json`（或通过 `/mcp` 命令添加）：
+编辑 `~/.zcode/config.json`，或在 ZCode 设置界面的 MCP 配置区域添加：
 
 ```json
 {
@@ -67,7 +145,34 @@ npm start
 }
 ```
 
-#### pi
+</details>
+
+<details>
+<summary><b>Claude Code</b></summary>
+
+用命令添加：
+
+```bash
+claude mcp add --transport http browser http://127.0.0.1:3000/mcp
+```
+
+或者在配置文件里写：
+
+```json
+{
+  "mcpServers": {
+    "browser": {
+      "type": "http",
+      "url": "http://127.0.0.1:3000/mcp"
+    }
+  }
+}
+```
+
+</details>
+
+<details>
+<summary><b>pi</b></summary>
 
 编辑 `~/.pi/agent/mcp.json`（配合 pi-mcp-extension）：
 
@@ -83,74 +188,32 @@ npm start
 }
 ```
 
-pi 无需手动启动 Relay：全局扩展 `~/.pi/agent/extensions/browser-relay-autostart.ts` 会在每次会话启动时检测 `127.0.0.1:3000`，未运行则自动拉起（日志写入 `/tmp/browser-mcp-relay.log`）。
+</details>
 
-配置后重启 ZCode / Claude Code，工具列表里会出现 `browser__computer`、`browser__navigate` 等工具。
+配置完成后重启客户端，工具列表里会出现 `browser__computer`、`browser__navigate` 等工具。
 
----
+## 使用示例
 
-## 可用工具
-
-| 工具 | 功能 |
-|------|------|
-| `computer` | 截图、点击、拖拽、输入文字、键盘快捷键、滚动、悬停、缩放。截图支持 `format`（jpeg/webp/png）、`fullPage` 全页、`quality` 1-100、`saveTo` 存盘、`maxDimension` 长边上限（默认 1280） |
-| `read_page` | 获取精简无障碍树（仅可见元素，祖先文本不重复；`filter:"interactive"` 只列可交互元素） |
-| `find` | 按关键词搜索页面元素 |
-| `form_input` | 填写表单字段（input / select / textarea） |
-| `navigate` | 跳转 URL，前进/后退，处理 beforeunload |
-| `javascript_tool` | 在页面上下文中执行 JavaScript |
-| `get_page_text` | 提取页面纯文本 |
-| `file_upload` | 上传本地文件到文件选择器 |
-| `resize_window` | 调整浏览器窗口大小 |
-| `read_console_messages` | 读取控制台日志缓冲 |
-| `read_network_requests` | 读取网络请求缓冲 |
-| `tabs_context` | 列出所有已打开的标签页 |
-| `tabs_create` | 创建新标签页 |
-| `tabs_close` | 关闭指定标签页 |
-| `wait_for` | 等待元素出现/消失、URL 变化、网络空闲或固定时长，替代盲等 |
-| `handle_dialog` | 应答 alert/confirm/prompt（配合 `dialog:"manual"` 使用） |
-| `save_pdf` | 页面导出 PDF 到本地文件（纸张/方向/背景可配） |
-| `cookies` | 读取/注入/删除/清除指定域的 Cookie（登录态管理） |
-| `downloads` | 列出下载、等待完成并返回本地文件路径、清除历史记录 |
-| `performance` | `metrics` 即时读取 LCP/CLS/INP/FCP/TTFB、JS 堆、DOM 节点数、监听器数、最慢资源；`trace_start` / `trace_stop` 录制 Chrome trace 并返回摘要（长任务、阻塞时间、主线程耗时分布、最重脚本），`reload:true` 可抓加载过程 |
-| `emulate` | CPU 降速、网络限速（Slow 3G / Fast 3G / Fast 4G / Offline）、深浅色模式、User-Agent 覆盖，`reset:true` 还原；配合 `performance` 做弱网/低端设备测试 |
-
-> v1.1：`computer` 与 `navigate` 支持 `dialog` 参数（`accept` 默认自动应答 / `dismiss` / `manual`），
-> JS 弹窗不再挂死会话；截图/PDF 产物通过 `saveTo` 落盘，配合 `file_upload` 形成本地文件闭环。
-
-### 图片与 token 优化
-
-图片 token 只取决于像素数，与文件字节数无关，因此优化集中在"少给像素"：
-
-- 截图按 CSS 像素输出并限制长边（默认 1280），高 DPR 屏不再返回 2~3 倍像素。
-- 缩放后点击/拖拽/滚动/zoom 的坐标，直接使用截图里看到的像素，扩展内部自动换算回页面坐标；全页截图不参与换算。
-- `zoom` 按区域从原图裁剪，保留原生清晰度，适合看细节而不必放大整页截图。
-- 单张图片超过约 1 MB（常见于 png / fullPage）时，relay 自动存到系统临时目录 `browser-mcp/`，只返回路径。
-- 优先用 `find` / `read_page` 定位元素，用 `ref` 点击；截图只在需要视觉确认时调用。
-
-## 典型工作流
+对 AI 说"打开 example.com，截个图，然后点击 Submit 按钮"，它会按下面的顺序调用工具：
 
 ```
-# 1. 先获取可用标签页
-tabs_context → 拿到 tabId
-
-# 2. 导航到目标页面
-navigate { tabId, url: "https://example.com" }
-
-# 3. 截图看一下当前状态
-computer { action: "screenshot", tabId }
-
-# 4. 找到要操作的元素
-find { tabId, query: "Submit" }  →  拿到 ref
-
-# 5. 点击
-computer { action: "left_click", tabId, ref: "ref_42" }
+tabs_context                                      → 拿到 tabId
+navigate  { tabId, url: "https://example.com" }   → 打开页面
+computer  { action: "screenshot", tabId }         → 看一眼当前状态
+find      { tabId, query: "Submit" }              → 拿到 ref_42
+computer  { action: "left_click", tabId, ref: "ref_42" }
 ```
 
-## 环境变量
+更多场景：
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
+- **排查前端问题**：`read_console_messages` 看报错，`read_network_requests` 看失败的请求，`javascript_tool` 现场执行代码。
+- **性能与弱网测试**：先用 `emulate` 限速并降 CPU，再用 `performance` 抓指标或录 trace。
+- **表单与文件**：`form_input` 填字段，`file_upload` 传文件，`save_pdf` 把结果导出。
+
+## 配置
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
 | `EXT_PORT` | `16789` | 扩展 WebSocket 端口 |
 | `MCP_PORT` | `3000` | MCP HTTP 端口 |
 
@@ -158,42 +221,68 @@ computer { action: "left_click", tabId, ref: "ref_42" }
 EXT_PORT=16789 MCP_PORT=3000 npm start
 ```
 
-## 常见问题
+> 修改 `EXT_PORT` 时，扩展里写死的地址 `ws://127.0.0.1:16789`（`extension/background.js` 顶部的 `RELAY_URL`）也要同步修改。
 
-**扩展显示 Disconnected**
-- 确认 Relay 已经在运行（`npm start`）
-- 检查 16789 端口是否被占用：`lsof -i :16789`
+## 安全说明
 
-**工具调用返回"No extension connected"**
-- 刷新扩展：`chrome://extensions` → 点击扩展的刷新按钮
-- 或重新加载扩展
+- Relay 的两个服务都只监听 `127.0.0.1`，局域网内其他机器连不上。
+- **没有鉴权**：本机上的任何进程都能调用 MCP 端点，进而操作你的浏览器，包括读取 Cookie 和执行页面脚本。请只在你信任的环境里运行，不要把端口转发或暴露出去。
+- 扩展申请了 `debugger`、`cookies`、`<all_urls>` 等较大的权限，这是实现截图、网络监听和 Cookie 管理所必需的。
 
-**ZCode/Claude Code 看不到工具**
-- 确认 `http://127.0.0.1:3000/mcp` 可访问（浏览器打开应返回 JSON）
-- 重启 ZCode / Claude Code
+## 开发
 
-## 项目结构
+```bash
+cd relay
+npm test    # node --test，覆盖入参宽松校验
+npm run dev # 文件变化后自动重启
+```
+
+图标源图由 `extension/icons/generate_icon_source.py` 生成，再用 `resize_icons.py` 缩放出 16 / 48 / 128 三个尺寸。
+
+### 项目结构
 
 ```
 browser-mcp/
-├── relay/                    # Node.js MCP Relay
+├── relay/                      # Node.js MCP Relay
 │   ├── package.json
-│   ├── test/                 # node --test（npm test）
+│   ├── test/                   # node --test
 │   └── src/
-│       ├── index.js          # 入口
-│       ├── bridge.js         # 扩展↔MCP 状态桥接
-│       ├── extension-ws.js   # WebSocket server (扩展侧)
-│       ├── schema-helpers.js # 宽松入参 schema（接受字符串形式的数字/布尔/数组）
-│       └── mcp-server.js     # MCP HTTP server (AI 侧)
-└── extension/                # Chrome 扩展 (Manifest V3)
+│       ├── index.js            # 入口
+│       ├── bridge.js           # 扩展与 MCP 之间的状态桥接
+│       ├── extension-ws.js     # WebSocket 服务（扩展侧）
+│       ├── schema-helpers.js   # 宽松入参 schema（接受字符串形式的数字/布尔/数组）
+│       └── mcp-server.js       # MCP HTTP 服务（AI 侧）
+└── extension/                  # Chrome 扩展 (Manifest V3)
     ├── manifest.json
-    ├── background.js         # Service Worker，工具实现
-    ├── popup.html / popup.js # 状态弹窗
+    ├── background.js           # Service Worker，工具实现
+    ├── popup.html / popup.js   # 状态弹窗
+    ├── icons/
     └── content-scripts/
-        ├── accessibility-tree.js  # 页面元素树
-        └── page-bridge.js         # 文本提取 & 元素搜索
+        ├── accessibility-tree.js   # 页面元素树
+        └── page-bridge.js          # 文本提取与元素搜索
 ```
+
+## 常见问题
+
+**扩展显示 Disconnected**
+确认 Relay 正在运行，并检查端口是否被占用：`lsof -i :16789`。
+
+**工具调用返回 "No extension connected"**
+在 `chrome://extensions` 里点击扩展的刷新按钮，或重新加载扩展。
+
+**客户端看不到工具**
+确认 `http://127.0.0.1:3000/mcp` 可访问，然后重启客户端。
+
+**`computer`、`javascript_tool` 等调用报 CDP attach 失败**
+页面刚跳转或重载时，Chrome 会短暂拒绝调试器附加，扩展会自动重试，共尝试 4 次。仍失败时等几秒再试，或用 `tabs_create` 新开标签页。`read_page`、`find`、`form_input`、`get_page_text` 不依赖调试器，这时仍可使用。
+
+**同一个标签页被多个 agent 同时操作**
+不同标签页之间完全隔离，但同一标签页上的并发点击、输入结果不可预测。请让每个 agent 使用各自的标签页。
+
+## 参与贡献
+
+欢迎提 Issue 和 Pull Request。提交前请先运行 `npm test`。
 
 ## 许可证
 
-[MIT](LICENSE)
+[MIT](LICENSE) © lycodeing

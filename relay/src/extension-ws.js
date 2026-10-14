@@ -14,7 +14,7 @@ import {
 const PING_INTERVAL = 20000;
 
 export function startExtensionWsServer(port = 16789) {
-  const wss = new WebSocketServer({ port });
+  const wss = new WebSocketServer({ port, host: '127.0.0.1' });
 
   wss.on('listening', () => {
     console.log(`[Relay] Extension WS server listening on ws://127.0.0.1:${port}`);
