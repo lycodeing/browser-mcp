@@ -178,10 +178,12 @@ EXT_PORT=16789 MCP_PORT=3000 npm start
 browser-mcp/
 ├── relay/                    # Node.js MCP Relay
 │   ├── package.json
+│   ├── test/                 # node --test（npm test）
 │   └── src/
 │       ├── index.js          # 入口
 │       ├── bridge.js         # 扩展↔MCP 状态桥接
 │       ├── extension-ws.js   # WebSocket server (扩展侧)
+│       ├── schema-helpers.js # 宽松入参 schema（接受字符串形式的数字/布尔/数组）
 │       └── mcp-server.js     # MCP HTTP server (AI 侧)
 └── extension/                # Chrome 扩展 (Manifest V3)
     ├── manifest.json

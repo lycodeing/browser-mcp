@@ -11,12 +11,13 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { invokeTool, isConnected, getExtensionInfo } from './bridge.js';
+import { lenientNumber as num, lenientBoolean as bool, lenientNumberTuple } from './schema-helpers.js';
 
 // ─── Tool schema helpers ────────────────────────────────────────────────────
 // 所有 schema 在模块加载时创建一次，避免每请求重建
 
-const Coordinate = z.array(z.number()).length(2).describe('(x, y) pixel coordinates');
-const Region = z.array(z.number()).length(4).describe('(x0, y0, x1, y1) rectangle');
+const Coordinate = lenientNumberTuple(2).describe('(x, y) pixel coordinates');
+const Region = lenientNumberTuple(4).describe('(x0, y0, x1, y1) rectangle');
 
 const SCHEMAS = {
   computer: {
@@ -25,112 +26,112 @@ const SCHEMAS = {
       'type', 'key', 'screenshot', 'wait', 'scroll', 'scroll_to',
       'left_click_drag', 'zoom', 'hover',
     ]).describe('Action to perform'),
-    tabId: z.number().describe('Target tab ID'),
+    tabId: num().describe('Target tab ID'),
     coordinate: Coordinate.optional(),
     start_coordinate: Coordinate.optional().describe('Drag start position'),
     region: Region.optional().describe('Region for zoom action [x0,y0,x1,y1]'),
     ref: z.string().optional().describe('Element ref from read_page or find'),
     text: z.string().optional().describe('Text to type or key to press'),
     scroll_direction: z.enum(['up', 'down', 'left', 'right']).optional(),
-    scroll_amount: z.number().min(1).max(10).optional(),
-    duration: z.number().min(0).max(10).optional().describe('Wait seconds'),
-    repeat: z.number().min(1).max(100).optional().describe('Key repeat count'),
+    scroll_amount: num(z.number().min(1).max(10)).optional(),
+    duration: num(z.number().min(0).max(10)).optional().describe('Wait seconds'),
+    repeat: num(z.number().min(1).max(100)).optional().describe('Key repeat count'),
     modifiers: z.string().optional().describe('ctrl/shift/alt/cmd combinations'),
     quality: z.union([
       z.enum(['low', 'medium', 'high']),
-      z.number().int().min(1).max(100),
+      num(z.number().int().min(1).max(100)),
     ]).optional().describe('Screenshot quality: preset or 1-100 (screenshot/zoom only)'),
     format: z.enum(['jpeg', 'webp', 'png']).optional().describe('Screenshot format, default jpeg'),
-    fullPage: z.boolean().optional().describe('Capture beyond viewport (screenshot only)'),
-    maxDimension: z.number().int().min(400).max(8000).optional().describe('Longest edge of the returned image in px, default 1280. Image tokens scale with pixel count, so keep it small; coordinates you pass back are in this image\'s pixels'),
+    fullPage: bool().optional().describe('Capture beyond viewport (screenshot only)'),
+    maxDimension: num(z.number().int().min(400).max(8000)).optional().describe('Longest edge of the returned image in px, default 1280. Image tokens scale with pixel count, so keep it small; coordinates you pass back are in this image\'s pixels'),
     saveTo: z.string().optional().describe('Absolute local path to save screenshot/PDF; returns path instead of full image on disk'),
-    returnImage: z.boolean().optional().describe('With saveTo: false to skip returning image data'),
+    returnImage: bool().optional().describe('With saveTo: false to skip returning image data'),
     dialog: z.enum(['accept', 'dismiss', 'manual']).optional()
       .describe('JS dialog policy during this action: auto-accept (default), auto-dismiss, or manual via handle_dialog'),
   },
   read_page: {
-    tabId: z.number().describe('Target tab ID'),
+    tabId: num().describe('Target tab ID'),
     filter: z.enum(['all', 'interactive']).optional().default('all'),
-    depth: z.number().min(1).max(50).optional().default(15),
-    max_chars: z.number().min(1000).max(200000).optional().default(50000),
+    depth: num(z.number().min(1).max(50)).optional().default(15),
+    max_chars: num(z.number().min(1000).max(200000)).optional().default(50000),
     ref_id: z.string().optional().describe('Focus on a specific element subtree'),
   },
   find: {
-    tabId: z.number(),
+    tabId: num(),
     query: z.string().describe('Keywords matching element text or label'),
-    max_results: z.number().min(1).max(100).optional().default(20),
+    max_results: num(z.number().min(1).max(100)).optional().default(20),
   },
   form_input: {
-    tabId: z.number(),
+    tabId: num(),
     ref: z.string().describe('Element ref from read_page or find'),
     value: z.union([z.string(), z.boolean(), z.number()]),
   },
   navigate: {
-    tabId: z.number(),
+    tabId: num(),
     url: z.string().describe('URL, "back", or "forward"'),
-    force: z.boolean().optional().describe('Dismiss unsaved-changes dialogs'),
+    force: bool().optional().describe('Dismiss unsaved-changes dialogs'),
     dialog: z.enum(['accept', 'dismiss', 'manual']).optional()
       .describe('JS dialog policy during navigation: auto-accept (default), auto-dismiss, or manual'),
   },
   javascript_tool: {
-    tabId: z.number(),
+    tabId: num(),
     text: z.string().min(1).describe('JS code to run (no return statement needed)'),
   },
   get_page_text: {
-    tabId: z.number(),
-    max_chars: z.number().min(1000).max(200000).optional().default(50000),
+    tabId: num(),
+    max_chars: num(z.number().min(1000).max(200000)).optional().default(50000),
   },
   file_upload: {
-    tabId: z.number(),
+    tabId: num(),
     paths: z.array(z.string()).min(1).describe('Absolute file paths to upload'),
     ref: z.string().optional().describe('Ref of input[type=file] element'),
     triggerRef: z.string().optional().describe('Ref of button that opens file picker'),
   },
   resize_window: {
-    tabId: z.number(),
-    width: z.number().min(400).max(7680),
-    height: z.number().min(300).max(4320),
+    tabId: num(),
+    width: num(z.number().min(400).max(7680)),
+    height: num(z.number().min(300).max(4320)),
   },
   read_console_messages: {
-    tabId: z.number(),
+    tabId: num(),
     pattern: z.string().optional().describe('Regex filter for message content'),
-    onlyErrors: z.boolean().optional().default(false),
-    clear: z.boolean().optional().default(false),
-    limit: z.number().min(1).max(1000).optional().default(100),
+    onlyErrors: bool().optional().default(false),
+    clear: bool().optional().default(false),
+    limit: num(z.number().min(1).max(1000)).optional().default(100),
   },
   read_network_requests: {
-    tabId: z.number(),
+    tabId: num(),
     urlPattern: z.string().optional().describe('Filter by URL substring'),
-    clear: z.boolean().optional().default(false),
-    limit: z.number().min(1).max(1000).optional().default(100),
+    clear: bool().optional().default(false),
+    limit: num(z.number().min(1).max(1000)).optional().default(100),
   },
   tabs_context: {},
   tabs_create: {},
   tabs_close: {
-    tabId: z.number().describe('Tab ID to close'),
+    tabId: num().describe('Tab ID to close'),
   },
   wait_for: {
-    tabId: z.number().describe('Target tab ID'),
+    tabId: num().describe('Target tab ID'),
     condition: z.enum(['element', 'element_gone', 'url', 'network_idle', 'time'])
       .describe('What to wait for'),
     text: z.string().optional().describe('element/element_gone: text to match (same semantics as find)'),
     urlPattern: z.string().optional().describe('url: substring the URL must contain'),
-    milliseconds: z.number().min(100).max(60000).optional().describe('time: duration in ms'),
-    idleMs: z.number().min(300).max(10000).optional().default(750).describe('network_idle: quiet window'),
-    timeoutMs: z.number().min(1000).max(120000).optional().default(15000),
+    milliseconds: num(z.number().min(100).max(60000)).optional().describe('time: duration in ms'),
+    idleMs: num(z.number().min(300).max(10000)).optional().default(750).describe('network_idle: quiet window'),
+    timeoutMs: num(z.number().min(1000).max(120000)).optional().default(15000),
   },
   handle_dialog: {
-    tabId: z.number().describe('Target tab ID'),
-    accept: z.boolean().optional().default(true).describe('true=accept/OK, false=dismiss/cancel'),
+    tabId: num().describe('Target tab ID'),
+    accept: bool().optional().default(true).describe('true=accept/OK, false=dismiss/cancel'),
     promptText: z.string().optional().describe('Text for prompt() dialogs'),
   },
   save_pdf: {
-    tabId: z.number().describe('Target tab ID'),
+    tabId: num().describe('Target tab ID'),
     saveTo: z.string().describe('Absolute local path to save the PDF'),
     paperFormat: z.enum(['Letter','Legal','Tabloid','Ledger','A0','A1','A2','A3','A4','A5','A6']).optional().default('A4'),
-    landscape: z.boolean().optional().default(false),
-    printBackground: z.boolean().optional().default(true),
-    scale: z.number().min(0.1).max(2).optional().default(1),
+    landscape: bool().optional().default(false),
+    printBackground: bool().optional().default(true),
+    scale: num(z.number().min(0.1).max(2)).optional().default(1),
   },
   cookies: {
     action: z.enum(['get', 'set', 'remove', 'clear']).describe('Cookie operation'),
@@ -142,30 +143,30 @@ const SCHEMAS = {
       value: z.string(),
       domain: z.string().optional(),
       path: z.string().optional(),
-      secure: z.boolean().optional(),
-      httpOnly: z.boolean().optional(),
-      expirationDate: z.number().optional(),
+      secure: bool().optional(),
+      httpOnly: bool().optional(),
+      expirationDate: num().optional(),
     })).optional().describe('set: cookies to write'),
   },
   downloads: {
     action: z.enum(['list', 'wait', 'erase']).describe('Download operation'),
     urlFilter: z.string().optional().describe('Filter by URL substring'),
-    downloadId: z.number().optional().describe('wait/erase: specific download ID'),
-    timeoutMs: z.number().min(1000).max(600000).optional().default(120000)
+    downloadId: num().optional().describe('wait/erase: specific download ID'),
+    timeoutMs: num(z.number().min(1000).max(600000)).optional().default(120000)
       .describe('wait: give up if not complete'),
   },
   performance: {
-    tabId: z.number().describe('Target tab ID'),
+    tabId: num().describe('Target tab ID'),
     action: z.enum(['metrics', 'trace_start', 'trace_stop']).describe('metrics: instant snapshot; trace_start/trace_stop: record a trace and get an analysed summary'),
-    reload: z.boolean().optional().default(false).describe('trace_start: reload the page (cache bypassed) once tracing begins, to capture load metrics'),
+    reload: bool().optional().default(false).describe('trace_start: reload the page (cache bypassed) once tracing begins, to capture load metrics'),
   },
   emulate: {
-    tabId: z.number().describe('Target tab ID'),
-    cpuThrottlingRate: z.number().min(1).max(20).optional().describe('CPU slowdown factor, 1 = off'),
+    tabId: num().describe('Target tab ID'),
+    cpuThrottlingRate: num(z.number().min(1).max(20)).optional().describe('CPU slowdown factor, 1 = off'),
     networkConditions: z.enum(['Offline', 'Slow 3G', 'Fast 3G', 'Fast 4G', 'none']).optional().describe('Network throttling preset, none = off'),
     colorScheme: z.enum(['dark', 'light', 'auto']).optional().describe('prefers-color-scheme override, auto = reset'),
     userAgent: z.string().optional().describe('User agent override, empty string = reset'),
-    reset: z.boolean().optional().default(false).describe('Clear all of the overrides above'),
+    reset: bool().optional().default(false).describe('Clear all of the overrides above'),
   },
 };
 
@@ -210,7 +211,7 @@ const TOOL_TIMEOUTS = {
 
 // ─── Build a fresh McpServer with all tools registered ──────────────────────────
 
-function buildMcpServer() {
+export function buildMcpServer() {
   const server = new McpServer({
     name: 'browser-mcp',
     version: '1.1.0',

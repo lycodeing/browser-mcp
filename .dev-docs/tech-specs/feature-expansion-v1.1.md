@@ -361,6 +361,35 @@ timeoutMs + 10s）。relay 的 TOOL_TIMEOUTS 对该工具设 610000。
 
 超时：relay 侧 performance 60000、emulate 10000；扩展侧 performance 70000。
 
+## 9.2 调用可靠性：宽松入参与 CDP attach 重试
+
+来源：一次真实会话里大量调用失败，归为两类互不相关的问题。
+
+**入参类型被拒绝（`Tool input failed inputSchema validation`）**
+
+该文案不出自 relay 或 MCP SDK（SDK 的文案是 `Input validation error: ...`），而是客户端拿 `tools/list` 公布的 JSON Schema 预校验时拦下的，请求到不了 relay。模型常把数字、布尔、数组序列化成字符串（`tabId:"123"`、`coordinate:"[601, 385]"`），被严格的 `z.number()` / `z.array()` 拒绝。
+
+处理（`relay/src/schema-helpers.js`）：
+
+- `lenientNumber(base)`：公布 `anyOf[number, 数字字符串]`，转换为 Number 后用原 `base` 再校验一次，范围约束（min/max/int）保持有效。
+- `lenientBoolean()`：接受 `true/false` 与 `"true"/"false"`。
+- `lenientNumberTuple(n)`：接受 `[x, y]` 或其 JSON 字符串，定长约束保持有效。
+- `mcp-server.js` 中所有数值、布尔、坐标参数改用上述构造器；转换发生在 relay，扩展端收到的始终是原生类型，WS 协议不变。
+- `buildMcpServer` 改为导出，供测试用 SDK 内存传输做端到端验证。
+
+测试：`cd relay && npm test`，覆盖公布的 schema 放行字符串、下发给扩展的参数已还原、原生类型不变、范围约束仍生效、非法字符串被拒绝。
+
+**CDP attach 被 Chrome 暂时拒绝（`Cannot access a chrome-extension:// URL of different extension`）**
+
+现象：页面点击后重载，随后依赖 `chrome.debugger` 的工具（`computer` 全部动作、`javascript_tool`、`read_console_messages`、`read_network_requests`、`wait_for` 的 `network_idle`）连续失败约 2 分钟；只走 `chrome.scripting` 的 `read_page` / `find` / `form_input` / `get_page_text` 与 `tabs_context` 始终正常。错误文案是 Chrome 的，具体触发条件尚未查清。
+
+处理（`extension/background.js` 的 `cdpAttach`）：
+
+- 失败后依次等待 200 / 600 / 1500 ms 重试，共 4 次，每次重试前先 detach 清理残留会话。
+- 仍失败时错误信息带上 tabId、URL、tab 状态，说明哪些工具受影响、哪些仍可用，并提示不要原样重发，改为等待、`tabs_create` 新开标签页或重新 navigate。
+
+未改动：`chrome.tabs.onUpdated` 在页面开始加载时 detach 的逻辑（提交 ff62bf8 为修复“导航后 CDP session 失效”而加）。是否可去掉需要先做对照实验，当前不改。
+
 ## 10. 权限与版本
 
 ### manifest.json 变更

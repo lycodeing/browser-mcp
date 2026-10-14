@@ -62,14 +62,40 @@ function sendMsg(obj) {
 }
 
 // ── CDP helpers ───────────────────────────────────────────────────────────────
-async function cdpAttach(tabId) {
-  if (cdpReady.has(tabId)) return;
+// 页面重载（如点击后跳转的登录页）期间 attach 可能被 Chrome 短暂拒绝，
+// 报 "Cannot access a chrome-extension:// URL of different extension"，数秒内自行恢复。
+const ATTACH_RETRY_DELAYS = [200, 600, 1500];
+
+async function cdpAttachOnce(tabId) {
   try { await chrome.debugger.detach({ tabId }); } catch {}
   await chrome.debugger.attach({ tabId }, '1.3');
   await chrome.debugger.sendCommand({ tabId }, 'Page.enable');
   await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable');
   await chrome.debugger.sendCommand({ tabId }, 'Network.enable');
-  cdpReady.add(tabId);
+}
+
+async function cdpAttach(tabId) {
+  if (cdpReady.has(tabId)) return;
+  let lastErr;
+  for (let i = 0; i <= ATTACH_RETRY_DELAYS.length; i++) {
+    try {
+      await cdpAttachOnce(tabId);
+      cdpReady.add(tabId);
+      return;
+    } catch (e) {
+      lastErr = e;
+      try { await chrome.debugger.detach({ tabId }); } catch {}
+      if (i < ATTACH_RETRY_DELAYS.length) await sleep(ATTACH_RETRY_DELAYS[i]);
+    }
+  }
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  throw new Error(
+    `CDP attach failed after ${ATTACH_RETRY_DELAYS.length + 1} attempts `
+    + `(tab ${tabId}, ${tab?.url || 'unknown url'}, status ${tab?.status || 'unknown'}): ${lastErr?.message}. `
+    + 'Tools that need the debugger (computer, javascript_tool, read_console_messages, read_network_requests) are unavailable on this tab right now; '
+    + 'read_page, find, form_input and get_page_text do not use it and still work. '
+    + 'Do not resend the identical call: wait a few seconds, open a fresh tab via tabs_create, or navigate again.'
+  );
 }
 
 async function cdpDetach(tabId) {
