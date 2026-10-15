@@ -7,6 +7,10 @@ import { normalizeUrl } from './lib/url.js';
 import { createTabsTool } from './tools/tabs.js';
 import { createNetworkStore } from './lib/network.js';
 import { createNetworkTool } from './tools/network.js';
+import { createEmulateTool } from './tools/emulate.js';
+import { createStorageTool } from './tools/storage.js';
+import { createInterceptStore } from './lib/intercept.js';
+import { createInterceptTools } from './tools/intercept.js';
 import {
   parseRef, mergeFrameTrees, mergeFindResults, formatFindLines, resolveFrameOffset, toTopPoint,
 } from './lib/frames.js';
@@ -812,6 +816,12 @@ async function toolReadConsole(args) {
 
 const toolTabs = createTabsTool({ chrome, ok, err, waitForLoad, sleep });
 const toolNetwork = createNetworkTool({ chrome, ok, err, ensureCdp, tabBuf });
+const toolStorage = createStorageTool({ chrome, ok, err });
+const interceptStore = createInterceptStore();
+const intercept = createInterceptTools({
+  chrome, ok, err, ensureCdp, store: interceptStore, sleep,
+  markAttached: (tabId) => cdpReady.add(tabId),
+});
 
 async function toolWaitFor(args) {
   const { tabId, condition, text, urlPattern, milliseconds, idleMs=750, timeoutMs=15000 } = args;
@@ -985,8 +995,8 @@ async function toolDownloads(args) {
 // ── performance / emulate ─────────────────────────────────────────────────────
 // tabId -> { events, truncated, resolve }  (Tracing.* 事件由 chrome.debugger.onEvent 填充)
 const traceSessions = new Map();
-// 设置过 emulate 覆盖的标签页：导航时不能 detach，否则覆盖随调试会话一起丢失
-const emulatedTabs = new Set();
+// 设置过 emulate 覆盖的标签页 -> 已生效的项名集合：导航时不能 detach，否则覆盖随调试会话一起丢失；reset 时按项还原
+const emulatedTabs = new Map();
 const MAX_TRACE_EVENTS = 600000;
 const TRACE_CATEGORIES = [
   'devtools.timeline', 'disabled-by-default-devtools.timeline', 'loading',
@@ -1180,35 +1190,7 @@ async function toolPerformance(args) {
   } catch (e) { return err(e.message); }
 }
 
-async function toolEmulate(args) {
-  const { tabId, cpuThrottlingRate, networkConditions, colorScheme, userAgent, reset = false } = args;
-  if (!tabId) return err('tabId required');
-  try {
-    await ensureCdp(tabId);
-    const send = (m, p) => chrome.debugger.sendCommand({ tabId }, m, p);
-    const applied = [];
-    const cpu = reset ? 1 : cpuThrottlingRate;
-    const net = reset ? 'none' : networkConditions;
-    const scheme = reset ? 'auto' : colorScheme;
-    const ua = reset ? '' : userAgent;
-
-    if (cpu != null) { await send('Emulation.setCPUThrottlingRate', { rate: cpu }); applied.push(`CPU throttling ${cpu}x`); }
-    if (net != null) {
-      const preset = NETWORK_PRESETS[net];
-      if (!preset) return err(`Unknown networkConditions: ${net}`);
-      await send('Network.emulateNetworkConditions', preset);
-      applied.push(`network ${net}`);
-    }
-    if (scheme != null) {
-      await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: scheme === 'auto' ? '' : scheme }] });
-      applied.push(`color scheme ${scheme}`);
-    }
-    if (ua != null) { await send('Emulation.setUserAgentOverride', { userAgent: ua }); applied.push(ua ? 'user agent override' : 'user agent reset'); }
-    if (!applied.length) return err('Nothing to apply: pass cpuThrottlingRate, networkConditions, colorScheme, userAgent or reset');
-    if (reset) emulatedTabs.delete(tabId); else emulatedTabs.add(tabId);
-    return ok([{ type: 'text', text: `Emulation applied: ${applied.join(', ')}. Overrides last until the debugger detaches (tab closed or DevTools opened) or reset:true.` }]);
-  } catch (e) { return err(e.message); }
-}
+const toolEmulate = createEmulateTool({ chrome, ok, err, ensureCdp, emulatedTabs, networkPresets: NETWORK_PRESETS });
 
 const TOOL_MAP = {
   performance: toolPerformance, emulate: toolEmulate,
@@ -1217,7 +1199,8 @@ const TOOL_MAP = {
   javascript_tool: toolJavascript, get_page_text: toolGetPageText,
   file_upload: toolFileUpload, resize_window: toolResizeWindow,
   read_console_messages: toolReadConsole, network: toolNetwork,
-  tabs: toolTabs,
+  tabs: toolTabs, storage: toolStorage,
+  intercept_add: intercept.intercept_add, intercept_list: intercept.intercept_list, intercept_remove: intercept.intercept_remove,
   wait_for: toolWaitFor, handle_dialog: toolHandleDialog, save_pdf: toolSavePdf,
   cookies: toolCookies, downloads: toolDownloads,
 };
@@ -1233,11 +1216,13 @@ function err(msg) { return { content:[{type:'text',text:`Error: ${msg}`}], isErr
 const QUEUED_ACTIONS = new Set(['left_click','right_click','double_click','triple_click',
   'type','key','scroll','scroll_to','left_click_drag','hover']);
 const QUEUED_TOOLS = new Set(['form_input','navigate','file_upload','javascript_tool']);
+const STORAGE_WRITE_ACTIONS = new Set(['set','remove','clear']);
 
 function isQueuedCall(tool, args) {
   if (!Number.isInteger(args?.tabId)) return false;
   if (tool === 'computer') return QUEUED_ACTIONS.has(args.action);
   if (tool === 'tabs') return args.action === 'reload';
+  if (tool === 'storage') return STORAGE_WRITE_ACTIONS.has(args.action);
   return QUEUED_TOOLS.has(tool);
 }
 
@@ -1270,6 +1255,7 @@ async function handleMessage(raw) {
 // ── Chrome event listeners ────────────────────────────────────────────────────
 chrome.debugger.onEvent.addListener((src, method, params) => {
   const tabId = src.tabId; if (!tabId) return;
+  if (method === 'Fetch.requestPaused') { intercept.handlePaused(tabId, params); return; }
   if (method.startsWith('Tracing.')) {
     const trace = traceSessions.get(tabId);
     if (!trace) return;
@@ -1314,13 +1300,17 @@ chrome.debugger.onEvent.addListener((src, method, params) => {
 });
 
 chrome.debugger.onDetach.addListener(src => {
-  if (src.tabId) { cdpReady.delete(src.tabId); traceSessions.delete(src.tabId); emulatedTabs.delete(src.tabId); }
+  if (src.tabId) {
+    cdpReady.delete(src.tabId); traceSessions.delete(src.tabId); emulatedTabs.delete(src.tabId);
+    intercept.handleDetach(src.tabId);
+  }
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {
   tabQueue.clear(tabId);
   traceSessions.delete(tabId);
   emulatedTabs.delete(tabId);
+  intercept.handleTabRemoved(tabId);
   tabEventBuffers.delete(tabId);
   shotScale.delete(tabId);
   cdpReady.delete(tabId);
@@ -1329,7 +1319,7 @@ chrome.tabs.onRemoved.addListener(tabId => {
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.status === 'loading') {
     // trace 与 emulate 覆盖依赖同一个调试会话，加载期间不能断开，否则 reload 压测会丢数据
-    if (traceSessions.has(tabId) || emulatedTabs.has(tabId)) return;
+    if (traceSessions.has(tabId) || emulatedTabs.has(tabId) || interceptStore.isActive(tabId)) return;
     // 页面开始加载时 CDP 会话失效，需重新附加
     cdpDetach(tabId).catch(() => {});
   }
@@ -1352,6 +1342,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   }
   return false;
 });
+
+// ── Keepalive ─────────────────────────────────────────────────────────────────
+// Service Worker 被回收后没有页面事件就不会重连 relay；周期闹钟把它唤醒，监听器必须在顶层同步注册
+function ensureConnected() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  if (reconnectTimer !== null) return;
+  connect();
+}
+chrome.alarms.create('keepalive', { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === 'keepalive') ensureConnected(); });
+chrome.runtime.onStartup.addListener(ensureConnected);
+chrome.runtime.onInstalled.addListener(ensureConnected);
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 connect();
