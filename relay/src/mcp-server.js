@@ -185,7 +185,48 @@ const SCHEMAS = {
     networkConditions: z.enum(['Offline', 'Slow 3G', 'Fast 3G', 'Fast 4G', 'none']).optional().describe('Network throttling preset, none = off'),
     colorScheme: z.enum(['dark', 'light', 'auto']).optional().describe('prefers-color-scheme override, auto = reset'),
     userAgent: z.string().optional().describe('User agent override, empty string = reset'),
-    reset: bool().optional().default(false).describe('Clear all of the overrides above'),
+    device: z.enum(['iphone-15', 'ipad-air', 'pixel-8']).optional().describe('Device preset: viewport, pixel ratio, touch and user agent. Explicit width/height/deviceScaleFactor/mobile/userAgent override the matching preset value'),
+    width: num(z.number().int().min(200).max(4000)).optional().describe('Viewport width in CSS px; needs height unless device is given'),
+    height: num(z.number().int().min(200).max(4000)).optional().describe('Viewport height in CSS px; needs width unless device is given'),
+    deviceScaleFactor: num(z.number().min(1).max(5)).optional().describe('Device pixel ratio'),
+    mobile: bool().optional().describe('Mobile viewport with touch events'),
+    latitude: num(z.number().min(-90).max(90)).optional().describe('Geolocation latitude; must be given together with longitude'),
+    longitude: num(z.number().min(-180).max(180)).optional().describe('Geolocation longitude; must be given together with latitude'),
+    accuracy: num(z.number().min(0).max(100000)).optional().describe('Geolocation accuracy in meters, default 100'),
+    timezone: z.string().optional().describe('IANA timezone name, e.g. Asia/Tokyo; empty string resets'),
+    locale: z.string().optional().describe('Locale such as ja-JP; changes Intl formatting, navigator.language and the Accept-Language request header; empty string resets'),
+    reset: bool().optional().default(false).describe('Clear all emulation overrides on the tab'),
+  },
+  storage: {
+    action: z.enum(['list', 'get', 'set', 'remove', 'clear', 'idb']).describe('Storage operation'),
+    tabId: num().describe('Target tab ID'),
+    area: z.enum(['local', 'session']).optional().describe('list/get/set/remove/clear: which storage, default local'),
+    key: z.string().optional().describe('get/set/remove: key'),
+    value: z.string().optional().describe('set: value (strings only; JSON.stringify objects first)'),
+    maxChars: num(z.number().int().min(100).max(200000)).optional().default(2000)
+      .describe('get: max characters of the value returned inline'),
+  },
+  intercept_add: {
+    tabId: num().describe('Target tab ID'),
+    urlPattern: z.string().min(1).describe('Wildcard pattern matched against the whole URL: * is zero or more characters, ? is exactly one, backslash escapes the next character'),
+    action: z.enum(['fail', 'fulfill', 'delay']).describe('fail: abort the request; fulfill: answer with a mock response; delay: hold the request, then let it through'),
+    method: z.string().optional().describe('Only match this HTTP method, case-insensitive'),
+    errorReason: z.enum([
+      'Failed', 'Aborted', 'TimedOut', 'AccessDenied', 'ConnectionClosed', 'ConnectionReset', 'ConnectionRefused',
+      'ConnectionAborted', 'ConnectionFailed', 'NameNotResolved', 'InternetDisconnected', 'AddressUnreachable',
+      'BlockedByClient', 'BlockedByResponse',
+    ]).optional().describe('fail: network error to simulate, default Failed'),
+    status: num(z.number().int().min(100).max(599)).optional().describe('fulfill: HTTP status, default 200'),
+    headers: z.record(z.string()).optional().describe('fulfill: response headers'),
+    body: z.string().optional().describe('fulfill: text response body, up to 1 MB'),
+    delayMs: num(z.number().int().min(1).max(60000)).optional().describe('delay: milliseconds to hold each matching request (required for delay)'),
+  },
+  intercept_list: {
+    tabId: num().describe('Target tab ID'),
+  },
+  intercept_remove: {
+    tabId: num().describe('Target tab ID'),
+    ruleId: z.string().optional().describe('Rule id from intercept_list; omit to remove all rules and turn interception off'),
   },
 };
 
@@ -210,7 +251,11 @@ const DESCRIPTIONS = {
   cookies: 'Read, set, remove, or clear browser cookies for a domain/URL (login-state management).',
   downloads: 'List downloads, wait for a download to complete and get its local path, or erase history entries.',
   performance: 'Inspect page performance. "metrics" returns an instant snapshot (LCP, CLS, INP, FCP, TTFB, JS heap, DOM nodes, listeners, slowest resources). "trace_start" then "trace_stop" records a Chrome trace and returns a summary (long tasks, blocking time, main-thread breakdown, heaviest scripts); use reload:true on trace_start to capture page load. Combine with emulate to test under throttling.',
-  emulate: 'Throttle CPU or network, override color scheme or user agent for a tab (CDP emulation). Overrides stay until reset:true or the debugger detaches.',
+  emulate: 'Emulate a device and environment on a tab (CDP): device presets (iphone-15, ipad-air, pixel-8) or custom width/height/deviceScaleFactor/mobile, geolocation, timezone, locale, CPU/network throttling, color scheme, user agent. Overrides stay until reset:true or the debugger detaches. Geolocation only reaches the page if the site already has location permission in Chrome; this tool cannot grant it.',
+  intercept_add: 'Intercept and mock network requests on a tab (CDP Fetch). Add a rule that matches requests by URL wildcard (and optionally method): fail aborts them with a network error, fulfill answers with a mock status/headers/body, delay holds them for delayMs. The first matching rule wins. Cross-origin mocks get access-control-allow-origin added and CORS preflights are answered automatically; credentialed cross-origin requests are not handled. Rules last until intercept_remove, the tab closes, or the debugger detaches (DevTools opened); they survive extension restarts. Mocked requests still show up in network list as normal responses.',
+  intercept_list: 'List the intercept rules on a tab with their hit counts and whether interception is currently active.',
+  intercept_remove: 'Remove one intercept rule by id, or all rules on the tab (omit ruleId), which also turns interception off.',
+  storage: 'Read and write localStorage / sessionStorage of the tab\'s main frame, or summarize IndexedDB. Actions: list (keys with size and a short preview), get (one value, truncated at maxChars), set / remove / clear (writes), idb (read-only summary of databases, object stores and record counts; record contents are never read). Works on the top-level frame\'s origin only, not on iframes; the first line of every result shows the origin. Values are not masked, treat them like cookies.',
 };
 
 // ─── Per-tool timeout (ms) ────────────────────────────────────────────────────
@@ -232,11 +277,12 @@ const BASE_TIMEOUTS = {
   resize_window: 10000, read_console_messages: 10000,
   wait_for: 130000, handle_dialog: 5000, save_pdf: 60000,
   cookies: 10000, downloads: 610000,
-  performance: 60000, emulate: 10000,
+  performance: 60000, emulate: 10000, storage: 10000,
+  intercept_add: 10000, intercept_list: 10000, intercept_remove: 10000,
 };
 
 /** 会进扩展侧串行队列的工具；其超时叠加排队等待，避免排队期间被 relay 判超时 */
-const QUEUED_TOOLS = new Set(['computer', 'form_input', 'navigate', 'file_upload', 'javascript_tool', 'tabs']);
+const QUEUED_TOOLS = new Set(['computer', 'form_input', 'navigate', 'file_upload', 'javascript_tool', 'tabs', 'storage']);
 
 /** 最终生效的超时表 = 基础表 + 排队工具的 QUEUE_WAIT_MS */
 export const TOOL_TIMEOUTS = Object.fromEntries(
@@ -248,7 +294,7 @@ export const TOOL_TIMEOUTS = Object.fromEntries(
 export function buildMcpServer() {
   const server = new McpServer({
     name: 'browser-mcp',
-    version: '2.0.0',
+    version: '2.1.0',
   });
 
   for (const [name, schema] of Object.entries(SCHEMAS)) {
@@ -422,7 +468,7 @@ export function startMcpServer(port = 3000) {
     const info = getExtensionInfo();
     res.json({
       service: 'browser-mcp-relay',
-      version: '2.0.0',
+      version: '2.1.0',
       extension: info,
     });
   });

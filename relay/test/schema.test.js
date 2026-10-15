@@ -37,16 +37,53 @@ test('公布的 schema 对数字/布尔/数组同时放行字符串形式', asyn
   }
 });
 
-test('工具清单恰好 19 个，旧工具已删除，新工具已就位', async () => {
+test('工具清单恰好 23 个，旧工具已删除，新工具已就位', async () => {
   const client = await connectClient();
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name);
-  assert.equal(names.length, 19);
+  assert.equal(names.length, 23);
   for (const old of ['tabs_context', 'tabs_create', 'tabs_close', 'read_network_requests']) {
     assert.ok(!names.includes(old), `${old} 应被删除`);
   }
   assert.ok(names.includes('tabs'));
   assert.ok(names.includes('network'));
+  assert.ok(names.includes('storage'));
+  for (const name of ['intercept_add', 'intercept_list', 'intercept_remove']) {
+    assert.ok(names.includes(name), `${name} 应存在`);
+  }
+});
+
+test('intercept_add 的数字参数放行字符串形式并还原为原生类型', async () => {
+  setExtensionWs(fakeWs);
+  received.length = 0;
+  const client = await connectClient();
+  await client.callTool({
+    name: 'intercept_add',
+    arguments: { tabId: '7', urlPattern: '*/api/*', action: 'fulfill', status: '201', body: '{}' },
+  });
+  assert.equal(received[0].tool, 'intercept_add');
+  assert.equal(received[0].arguments.tabId, 7);
+  assert.equal(received[0].arguments.status, 201);
+
+  received.length = 0;
+  await client.callTool({
+    name: 'intercept_add',
+    arguments: { tabId: 7, urlPattern: '*', action: 'delay', delayMs: '1500' },
+  });
+  assert.equal(received[0].arguments.delayMs, 1500);
+});
+
+test('intercept_add 拒绝越界的 delayMs 和未知 errorReason', async () => {
+  setExtensionWs(fakeWs);
+  const client = await connectClient();
+  const tooLong = await client.callTool({
+    name: 'intercept_add', arguments: { tabId: 7, urlPattern: '*', action: 'delay', delayMs: 60001 },
+  });
+  assert.equal(tooLong.isError, true);
+  const badReason = await client.callTool({
+    name: 'intercept_add', arguments: { tabId: 7, urlPattern: '*', action: 'fail', errorReason: 'Nope' },
+  });
+  assert.equal(badReason.isError, true);
 });
 
 test('tabs 的 tabIds 公布 anyOf，客户端预校验可放行字符串形式', async () => {
@@ -154,6 +191,71 @@ test('非法字符串被拒绝', async () => {
   const client = await connectClient();
   const res = await client.callTool({
     name: 'tabs', arguments: { action: 'close', tabIds: ['abc'] },
+  });
+  assert.equal(res.isError, true);
+});
+
+test('emulate 新参数的字符串数字/布尔还原，旧参数仍可用', async () => {
+  setExtensionWs(fakeWs);
+  const client = await connectClient();
+  received.length = 0;
+  await client.callTool({
+    name: 'emulate',
+    arguments: {
+      tabId: '5', device: 'iphone-15', width: '500', height: '900', deviceScaleFactor: '2.5',
+      mobile: 'true', latitude: '35.68', longitude: '139.76', accuracy: '50',
+      timezone: 'Asia/Tokyo', locale: 'ja-JP',
+    },
+  });
+  const a = received[0].arguments;
+  assert.equal(received[0].tool, 'emulate');
+  assert.equal(a.tabId, 5);
+  assert.equal(a.width, 500);
+  assert.equal(a.height, 900);
+  assert.equal(a.deviceScaleFactor, 2.5);
+  assert.equal(a.mobile, true);
+  assert.equal(a.latitude, 35.68);
+  assert.equal(a.longitude, 139.76);
+  assert.equal(a.accuracy, 50);
+  assert.equal(a.timezone, 'Asia/Tokyo');
+  assert.equal(a.locale, 'ja-JP');
+
+  received.length = 0;
+  await client.callTool({ name: 'emulate', arguments: { tabId: 5, colorScheme: 'dark', cpuThrottlingRate: '4' } });
+  assert.equal(received[0].arguments.colorScheme, 'dark');
+  assert.equal(received[0].arguments.cpuThrottlingRate, 4);
+});
+
+test('emulate 新参数的范围与枚举约束', async () => {
+  setExtensionWs(fakeWs);
+  const client = await connectClient();
+  for (const bad of [
+    { device: 'nokia' }, { width: 100 }, { height: 5000 }, { deviceScaleFactor: 9 },
+    { latitude: 91, longitude: 0 }, { longitude: -181, latitude: 0 }, { accuracy: -1 },
+  ]) {
+    const res = await client.callTool({ name: 'emulate', arguments: { tabId: 1, ...bad } });
+    assert.equal(res.isError, true, `应拒绝 ${JSON.stringify(bad)}`);
+  }
+});
+
+test('storage 的数字参数接受字符串形式并转换后下发', async () => {
+  setExtensionWs(fakeWs);
+  received.length = 0;
+  const client = await connectClient();
+  await client.callTool({
+    name: 'storage',
+    arguments: { action: 'get', tabId: '7', key: 'token', maxChars: '500' },
+  });
+  assert.equal(received[0].tool, 'storage');
+  assert.equal(received[0].arguments.tabId, 7);
+  assert.equal(received[0].arguments.maxChars, 500);
+});
+
+test('storage 的 maxChars 超出范围被拒绝', async () => {
+  setExtensionWs(fakeWs);
+  const client = await connectClient();
+  const res = await client.callTool({
+    name: 'storage', arguments: { action: 'get', tabId: 1, key: 'k', maxChars: '50' },
   });
   assert.equal(res.isError, true);
 });

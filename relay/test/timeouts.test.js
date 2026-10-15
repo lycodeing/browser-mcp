@@ -10,6 +10,8 @@ test('排队工具的超时 = 基础值 + 30 秒排队等待', () => {
   assert.equal(TOOL_TIMEOUTS.javascript_tool, 60000);
   // tabs 基础值 40000（含 create 的页面加载），叠加后 70000
   assert.equal(TOOL_TIMEOUTS.tabs, 70000);
+  // storage 的写操作进队列，基础值 10000 叠加后 40000
+  assert.equal(TOOL_TIMEOUTS.storage, 40000);
 });
 
 test('非排队工具的超时不受排队等待影响', () => {
@@ -26,8 +28,12 @@ test('非排队工具的超时不受排队等待影响', () => {
 
 test('超时表覆盖全部工具且不含旧工具名', () => {
   const names = Object.keys(TOOL_TIMEOUTS).sort();
-  assert.equal(names.length, 19);
+  assert.equal(names.length, 23);
   for (const old of ['tabs_context', 'tabs_create', 'tabs_close', 'read_network_requests']) {
     assert.ok(!names.includes(old), `${old} 应被删除`);
+  }
+  for (const name of ['intercept_add', 'intercept_list', 'intercept_remove']) {
+    assert.ok(names.includes(name), `${name} 应存在`);
+    assert.equal(TOOL_TIMEOUTS[name], 10000);
   }
 });
