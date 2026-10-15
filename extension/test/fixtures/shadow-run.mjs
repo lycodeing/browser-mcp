@@ -77,6 +77,7 @@ try {
     'slot 内容不重复出现': (tree.match(/Slotted Btn/g) || []).length === 1,
     'find 进入 shadow root': found.includes('Shadow Btn') && found.includes('Slotted Btn'),
     'find 进入嵌套 shadow': nested.length === 1,
+    'find 结果无重复': new Set(found).size === found.length,
     'closed shadow 不可见（已知限制）': !/Closed Btn/.test(tree),
   };
   for (const [k, v] of Object.entries(checks)) console.log(v ? 'PASS' : 'FAIL', k);
