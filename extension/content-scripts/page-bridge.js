@@ -57,10 +57,17 @@
     }
 
     const results = [];
-    // 精准选择器直接命中可交互元素，避免全量 DOM 扫描
-    const allEls = document.querySelectorAll(
-      'a, button, input, select, textarea, label, [role], [tabindex]'
-    );
+    // 精准选择器直接命中可交互元素，避免全量 DOM 扫描；递归进入 open shadow root
+    const SELECTOR = 'a, button, input, select, textarea, label, [role], [tabindex]';
+    const MAX_SHADOW_DEPTH = 20;
+    const allEls = [];
+    (function collect(root, depth) {
+      allEls.push(...root.querySelectorAll(SELECTOR));
+      if (depth >= MAX_SHADOW_DEPTH) return;
+      for (const host of root.querySelectorAll('*')) {
+        if (host.shadowRoot) collect(host.shadowRoot, depth + 1);
+      }
+    })(document, 0);
 
     for (const el of allEls) {
       if (!isVisible(el)) continue;

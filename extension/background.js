@@ -1,10 +1,21 @@
 // background.js — browser-mcp Service Worker
 // Connects to local relay via WebSocket and executes CDP tool calls
 
+import { createTabQueue, TabBusyError } from './lib/tab-queue.js';
+import { withTimeout } from './lib/timeout.js';
+import { normalizeUrl } from './lib/url.js';
+import { createTabsTool } from './tools/tabs.js';
+import { createNetworkStore } from './lib/network.js';
+import { createNetworkTool } from './tools/network.js';
+import {
+  parseRef, mergeFrameTrees, mergeFindResults, formatFindLines, resolveFrameOffset, toTopPoint,
+} from './lib/frames.js';
+
 // ── Constants ────────────────────────────────────────────────────────────────
 const RELAY_URL = 'ws://127.0.0.1:16789';
 const RECONNECT_DELAYS = [1000, 2000, 5000, 10000, 30000];
 const TOOL_TIMEOUT = 60000;
+const tabQueue = createTabQueue({ waitMs: 30000 });
 
 // ── State ────────────────────────────────────────────────────────────────────
 let ws = null;
@@ -16,8 +27,6 @@ let stopped = false;
 const tabEventBuffers = new Map();
 // tabId -> true  (CDP attached + domains enabled)
 const cdpReady = new Set();
-// tabId -> true  (content scripts injected)
-const csInjected = new Set();
 // tabId -> 'accept' | 'dismiss' | 'manual' (JS dialog policy, set during a tool call)
 const dialogModes = new Map();
 
@@ -92,9 +101,9 @@ async function cdpAttach(tabId) {
   throw new Error(
     `CDP attach failed after ${ATTACH_RETRY_DELAYS.length + 1} attempts `
     + `(tab ${tabId}, ${tab?.url || 'unknown url'}, status ${tab?.status || 'unknown'}): ${lastErr?.message}. `
-    + 'Tools that need the debugger (computer, javascript_tool, read_console_messages, read_network_requests) are unavailable on this tab right now; '
+    + 'Tools that need the debugger (computer, javascript_tool, read_console_messages, network) are unavailable on this tab right now; '
     + 'read_page, find, form_input and get_page_text do not use it and still work. '
-    + 'Do not resend the identical call: wait a few seconds, open a fresh tab via tabs_create, or navigate again.'
+    + 'Do not resend the identical call: wait a few seconds, open a fresh tab via tabs (action create), or navigate again.'
   );
 }
 
@@ -112,26 +121,56 @@ async function ensureCdp(tabId) {
   await cdpAttach(tabId);
 }
 
+// 内容脚本自带幂等守卫，每次调用对所有 frame 注入即可；新出现的 iframe 在下一次调用时被覆盖
 async function ensureCs(tabId) {
-  if (csInjected.has(tabId)) return;
-  try {
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => !!globalThis.__pageBridge,
-    });
-    if (res?.result) { csInjected.add(tabId); return; }
-  } catch {}
   await chrome.scripting.executeScript({
-    target: { tabId },
-    files: ['content-scripts/accessibility-tree.js', 'content-scripts/page-bridge.js'],
+    target: { tabId, allFrames: true },
+    files: ['content-scripts/accessibility-tree.js', 'content-scripts/page-bridge.js',
+            'content-scripts/frame-link.js'],
   });
-  csInjected.add(tabId);
+}
+
+const refNotFound = (refStr) => parseRef(refStr)?.frameId
+  ? `Element not found: ${refStr}. The frame may have navigated; run read_page or find again.`
+  : `Element not found: ${refStr}`;
+
+// 在 ref 所属的 frame 里执行；frame 已不存在时返回 undefined
+async function runInRefFrame(tabId, parsed, func, args) {
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [parsed.frameId] }, func, args,
+    });
+    return r?.result;
+  } catch {
+    return undefined;
+  }
+}
+
+// 所有 frame 先握手再采集：父 frame 的 children 要等子 frame 的 hello 到达后才完整
+async function collectFrameInfos(tabId) {
+  const target = { tabId, allFrames: true };
+  await chrome.scripting.executeScript({
+    target, func: async () => { await globalThis.__frameLink?.link(); },
+  });
+  const results = await chrome.scripting.executeScript({
+    target, func: () => globalThis.__frameLink?.collect() ?? null,
+  });
+  return results.filter((r) => r.result).map((r) => ({ ...r.result, frameId: r.frameId }));
+}
+
+async function searchAllFrames(tabId, query, max) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    func: (q, m) => globalThis.__pageBridge?.searchElements(q, m) ?? [],
+    args: [query, max],
+  });
+  return results.map((r) => ({ frameId: r.frameId, items: r.result || [] }));
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function tabBuf(tabId) {
-  if (!tabEventBuffers.has(tabId)) tabEventBuffers.set(tabId, { console: [], network: [], dialogs: [] });
+  if (!tabEventBuffers.has(tabId)) tabEventBuffers.set(tabId, { console: [], network: createNetworkStore({ capacity: 1000 }), dialogs: [] });
   const buf = tabEventBuffers.get(tabId);
   if (!buf.dialogs) buf.dialogs = [];
   return buf;
@@ -286,13 +325,20 @@ function toCss(tabId, pt) {
   return s === 1 ? pt : [pt[0] / s, pt[1] / s];
 }
 
-async function getElemCoords(tabId, ref) {
-  const [r] = await chrome.scripting.executeScript({
-    target:{tabId},
-    func: ref => globalThis.__accessibilityTree?.getElementCoordinates(ref, {scrollIntoView:true}) ?? null,
-    args:[ref],
-  });
-  return r?.result ?? null;
+// ref 所在 frame 内的坐标加上沿 frame 链的偏移，得到顶层视口坐标；找不到返回 null
+async function getElemCoords(tabId, refStr) {
+  const parsed = parseRef(refStr);
+  if (!parsed) return null;
+  const pt = await runInRefFrame(tabId, parsed,
+    (ref) => globalThis.__accessibilityTree?.getElementCoordinates(ref, { scrollIntoView: true }) ?? null,
+    [parsed.ref]);
+  if (!pt) return null;
+  if (!parsed.frameId) return pt;
+  // 滚动发生在 getElementCoordinates 之后，偏移必须此刻现读
+  const off = resolveFrameOffset(parsed.frameId, await collectFrameInfos(tabId));
+  if (!off) throw new Error(`Cannot locate frame f${parsed.frameId} in the page (frame handshake incomplete). Run read_page again and retry.`);
+  const [x, y] = toTopPoint(off, [pt.x, pt.y]);
+  return { x: Math.round(x), y: Math.round(y) };
 }
 
 async function toolComputer(args) {
@@ -347,12 +393,14 @@ async function computerDispatch(args, tabId, action) {
     }
     case 'scroll_to': {
       if (!args.ref) return err('ref required for scroll_to');
+      const parsed = parseRef(args.ref);
+      if (!parsed) return err(refNotFound(args.ref));
       await ensureCs(tabId);
-      const [r] = await chrome.scripting.executeScript({target:{tabId},
-        func:ref=>{const el=globalThis.__accessibilityTree?.getElementByRef(ref);
-          if(!el)return false; el.scrollIntoView({behavior:'instant',block:'center'}); return true;},
-        args:[args.ref]});
-      return r?.result ? ok([{type:'text',text:`Scrolled to ${args.ref}`}]) : err(`Element not found: ${args.ref}`);
+      const found = await runInRefFrame(tabId, parsed,
+        (ref) => { const el = globalThis.__accessibilityTree?.getElementByRef(ref);
+          if (!el) return false; el.scrollIntoView({ behavior: 'instant', block: 'center' }); return true; },
+        [parsed.ref]);
+      return found ? ok([{type:'text',text:`Scrolled to ${args.ref}`}]) : err(refNotFound(args.ref));
     }
     case 'type': {
       const text = args.text || '';
@@ -392,7 +440,7 @@ async function computerDispatch(args, tabId, action) {
       if (args.ref) {
         await ensureCs(tabId);
         const c = await getElemCoords(tabId,args.ref);
-        if (!c) return err(`Element not found: ${args.ref}`);
+        if (!c) return err(refNotFound(args.ref));
         x=c.x; y=c.y;
       } else if (args.coordinate) {[x,y]=toCss(tabId,args.coordinate);} else return err('coordinate or ref required');
       await chrome.debugger.sendCommand({tabId},'Input.dispatchMouseEvent',{type:'mouseMoved',x,y});
@@ -430,7 +478,7 @@ async function computerDispatch(args, tabId, action) {
       if (args.ref) {
         await ensureCs(tabId);
         const c = await getElemCoords(tabId,args.ref);
-        if (!c) return err(`Element not found: ${args.ref}`);
+        if (!c) return err(refNotFound(args.ref));
         x=c.x; y=c.y;
       } else if (args.coordinate) {[x,y]=toCss(tabId,args.coordinate);} else return err('coordinate or ref required');
       const btn = action==='right_click'?'right':'left';
@@ -452,50 +500,53 @@ async function toolReadPage(args) {
   await ensureCs(tabId);
   const filter = args.filter||'all', depth = args.depth||15, maxChars = args.max_chars||50000;
   const refId = args.ref_id||null;
-  const [r] = await chrome.scripting.executeScript({
-    target:{tabId},
-    func:(f,d,m,ri)=>{
-      const t = globalThis.__accessibilityTree;
-      return t ? t.generate(f,d,m,ri) : {error:'Accessibility tree not available'};
-    },
-    args:[filter,depth,maxChars,refId],
-  });
-  const res = r?.result;
-  if (!res||res.error) return err(res?.error||'Failed to generate page tree');
-  const tree = res.tree||'(empty)';
-  const trunc = res.truncated ? ', truncated — use ref_id or increase max_chars' : '';
-  return ok([{type:'text',text:`Page tree (${res.elementCount||0} elements, filter:${filter}${trunc}):\n\n${tree}`}]);
+  const parsedRef = refId ? parseRef(refId) : null;
+  if (refId && !parsedRef) return err(refNotFound(refId));
+
+  const func = (f, d, m, ri) => {
+    const t = globalThis.__accessibilityTree;
+    if (!t) return { error: 'Accessibility tree not available' };
+    const info = globalThis.__frameLink?.info();
+    return { ...t.generate(f, d, m, ri), url: location.href, name: window.name || '', depth: info?.depth ?? 0 };
+  };
+  const target = parsedRef ? { tabId, frameIds: [parsedRef.frameId] } : { tabId, allFrames: true };
+  let injected;
+  try {
+    injected = await chrome.scripting.executeScript({ target, func, args: [filter, depth, maxChars, parsedRef ? parsedRef.ref : null] });
+  } catch (e) {
+    return err(parsedRef ? refNotFound(refId) : `Failed to generate page tree: ${e.message}`);
+  }
+  const results = injected.filter(r => r.result && !r.result.error).map(r => ({ frameId: r.frameId, ...r.result }));
+  const main = results.find(r => r.frameId === 0) || results[0];
+  if (!main) return err(injected[0]?.result?.error || 'Failed to generate page tree');
+  if (parsedRef && String(main.tree).startsWith('[Error]')) return err(refNotFound(refId));
+
+  const merged = mergeFrameTrees(results, maxChars);
+  const trunc = merged.truncated ? ', truncated — use ref_id or increase max_chars' : '';
+  const frames = merged.frameCount > 1 ? `, ${merged.frameCount} frames` : '';
+  return ok([{type:'text',text:`Page tree (${merged.elementCount} elements${frames}, filter:${filter}${trunc}):\n\n${merged.body || '(empty)'}`}]);
 }
 
 async function toolFind(args) {
   const tabId = args.tabId; if (!tabId) return err('tabId required');
   await ensureCs(tabId);
-  const [r] = await chrome.scripting.executeScript({
-    target:{tabId},
-    func:(q,max)=>{
-      const b = globalThis.__pageBridge;
-      return b ? b.searchElements(q,max) : [];
-    },
-    args:[args.query||'', args.max_results||20],
-  });
-  const items = r?.result||[];
-  if (!items.length) return ok([{type:'text',text:`No elements found matching: "${args.query}"`}]);
-  const lines = items.map((el,i)=>`${i+1}. [${el.ref}] ${el.role} - "${el.text}" (score:${el.score})`);
-  return ok([{type:'text',text:`Found ${items.length} elements:\n\n${lines.join('\n')}`}]);
+  const merged = mergeFindResults(await searchAllFrames(tabId, args.query||'', args.max_results||20), args.max_results||20);
+  if (!merged.length) return ok([{type:'text',text:`No elements found matching: "${args.query}"`}]);
+  return ok([{type:'text',text:`Found ${merged.length} elements:\n\n${formatFindLines(merged).join('\n')}`}]);
 }
 
 async function toolFormInput(args) {
   const {tabId,ref,value} = args;
   if (!tabId) return err('tabId required');
   if (!ref) return err('ref required');
+  const parsed = parseRef(ref);
+  if (!parsed) return err(refNotFound(ref));
   await ensureCs(tabId);
-  const [r] = await chrome.scripting.executeScript({
-    target:{tabId},
-    func:(ref,value)=>{
+  const res = await runInRefFrame(tabId, parsed, (ref, value) => {
       const tree = globalThis.__accessibilityTree;
       if (!tree) return {success:false,error:'Accessibility tree not available'};
       const el = tree.getElementByRef(ref);
-      if (!el) return {success:false,error:`Element not found: ${ref}`};
+      if (!el) return {success:false,error:'not-found'};
       const tag = el.tagName.toLowerCase();
       if (!['input','select','textarea'].includes(tag) && !el.isContentEditable)
         return {success:false,error:`${el.tagName} is not a form control`};
@@ -521,11 +572,9 @@ async function toolFormInput(args) {
       } else if (tag==='textarea') setNative(el,String(value));
       else { el.focus(); document.execCommand('selectAll',false,null); document.execCommand('insertText',false,String(value)); }
       return {success:true,fieldName:el.name||el.id||ref};
-    },
-    args:[ref,value],
-  });
-  const res = r?.result;
-  if (!res?.success) return err(res?.error||'Failed to set value');
+    }, [parsed.ref, value]);
+  if (!res) return err(refNotFound(ref));
+  if (!res.success) return err(res.error === 'not-found' ? refNotFound(ref) : (res.error||'Failed to set value'));
   return ok([{type:'text',text:`Set value for ${res.fieldName}`}]);
 }
 async function toolNavigate(args) {
@@ -544,8 +593,6 @@ async function toolNavigate(args) {
 
 async function navigateImpl({tabId, url, force=false}) {
 
-  const RESTRICTED = /^(chrome|chrome-extension|edge|devtools|about|javascript):/i;
-
   if (url === 'back' || url === 'forward') {
     const before = (await chrome.tabs.get(tabId)).url;
     try {
@@ -560,11 +607,9 @@ async function navigateImpl({tabId, url, force=false}) {
     return ok([{type:'text',text:`Navigated ${url} to: ${after.url}\nTitle: ${after.title}`}]);
   }
 
-  let finalUrl = url.trim();
-  if (RESTRICTED.test(finalUrl)) return err(`Blocked URL: ${finalUrl}`);
-  if (!/^https?:\/\//i.test(finalUrl) && !/^[a-z][a-z0-9+.-]*:\/\//i.test(finalUrl))
-    finalUrl = 'https://' + finalUrl;
-  if (RESTRICTED.test(finalUrl)) return err(`Blocked URL: ${finalUrl}`);
+  const norm = normalizeUrl(url);
+  if (norm.error) return err(norm.error);
+  const finalUrl = norm.url;
 
   const t0 = Date.now();
   await chrome.tabs.update(tabId, {url: finalUrl});
@@ -666,6 +711,9 @@ async function toolFileUpload(args) {
   const {tabId, paths, ref, triggerRef} = args;
   if (!tabId) return err('tabId required');
   if (!paths?.length) return err('paths required');
+  for (const r of [ref, triggerRef]) {
+    if (r && parseRef(r)?.frameId) return err(`file_upload does not support elements inside iframes yet (${r}). Use a ref from the main frame.`);
+  }
   await ensureCdp(tabId);
 
   if (ref) {
@@ -762,38 +810,8 @@ async function toolReadConsole(args) {
   return ok([{type:'text',text:`Console (${msgs.length}${clear?', cleared':''}):\n\n${lines.join('\n')}`}]);
 }
 
-async function toolReadNetwork(args) {
-  const {tabId, urlPattern, clear=false, limit=100} = args;
-  if (!tabId) return err('tabId required');
-  await ensureCdp(tabId);
-  const buf = tabBuf(tabId);
-  let reqs = [...buf.network];
-  if (urlPattern) reqs=reqs.filter(r=>r.url.includes(urlPattern));
-  reqs=reqs.slice(-limit);
-  if (clear) buf.network=[];
-  if (!reqs.length) return ok([{type:'text',text:'No network requests'}]);
-  const lines=reqs.map(r=>`${r.method.padEnd(4)} ${String(r.status||'---').padStart(3)} [${(r.type||'other').slice(0,10).padEnd(10)}] ${r.url}`);
-  return ok([{type:'text',text:`Network (${reqs.length}${clear?', cleared':''}):\n\n${lines.join('\n')}`}]);
-}
-
-async function toolTabsContext(_args) {
-  const tabs = await chrome.tabs.query({});
-  const filtered = tabs.filter(t=>!/^(chrome|chrome-extension|devtools|about):/.test(t.url||''));
-  const lines = filtered.map((t,i)=>`${i+1}. [${t.id}]${t.active?' [ACTIVE]':''} "${t.title||'Untitled'}"\n   ${t.url}`);
-  return ok([{type:'text',text:`Open tabs (${filtered.length}):\n\n${lines.join('\n')}`}]);
-}
-
-async function toolTabsCreate(_args) {
-  const tab = await chrome.tabs.create({url:'about:blank',active:true});
-  await sleep(300);
-  return ok([{type:'text',text:`Created tab [${tab.id}]`}]);
-}
-
-async function toolTabsClose(args) {
-  if (!args.tabId) return err('tabId required');
-  await chrome.tabs.remove(args.tabId);
-  return ok([{type:'text',text:`Closed tab [${args.tabId}]`}]);
-}
+const toolTabs = createTabsTool({ chrome, ok, err, waitForLoad, sleep });
+const toolNetwork = createNetworkTool({ chrome, ok, err, ensureCdp, tabBuf });
 
 async function toolWaitFor(args) {
   const { tabId, condition, text, urlPattern, milliseconds, idleMs=750, timeoutMs=15000 } = args;
@@ -817,20 +835,14 @@ async function toolWaitFor(args) {
           return ok([{type:'text',text:`URL matched after ${Date.now()-t0}ms: ${url}`}]);
       } else if (condition === 'network_idle') {
         await ensureCdp(tabId);
-        const reqs = tabBuf(tabId)?.network || [];
-        const last = reqs.length ? reqs[reqs.length-1].timestamp : 0;
-        const quiet = Date.now() - last;
-        lastObserved = `${reqs.length} requests buffered, last ${quiet}ms ago`;
+        const store = tabBuf(tabId).network;
+        const quiet = Date.now() - (store.lastStartedAt() || t0);
+        lastObserved = `${store.size()} requests buffered, last ${quiet}ms ago`;
         if (quiet >= idleMs)
           return ok([{type:'text',text:`Network idle after ${Date.now()-t0}ms (no new requests for ${quiet}ms)`}]);
       } else {
         await ensureCs(tabId);
-        const [r] = await chrome.scripting.executeScript({
-          target:{tabId},
-          func:(q,max)=>{ const b = globalThis.__pageBridge; return b ? b.searchElements(q, max) : []; },
-          args:[text||'', 1],
-        });
-        const found = (r?.result||[]).length > 0;
+        const found = (await searchAllFrames(tabId, text||'', 1)).some(f => f.items.length > 0);
         lastObserved = found ? `element "${text}" present` : `element "${text}" absent`;
         if (condition === 'element' && found)
           return ok([{type:'text',text:`Element "${text}" appeared after ${Date.now()-t0}ms`}]);
@@ -1204,8 +1216,8 @@ const TOOL_MAP = {
   form_input: toolFormInput, navigate: toolNavigate,
   javascript_tool: toolJavascript, get_page_text: toolGetPageText,
   file_upload: toolFileUpload, resize_window: toolResizeWindow,
-  read_console_messages: toolReadConsole, read_network_requests: toolReadNetwork,
-  tabs_context: toolTabsContext, tabs_create: toolTabsCreate, tabs_close: toolTabsClose,
+  read_console_messages: toolReadConsole, network: toolNetwork,
+  tabs: toolTabs,
   wait_for: toolWaitFor, handle_dialog: toolHandleDialog, save_pdf: toolSavePdf,
   cookies: toolCookies, downloads: toolDownloads,
 };
@@ -1216,6 +1228,18 @@ const EXT_TOOL_TIMEOUTS = { wait_for: 135000, downloads: 620000, save_pdf: 70000
 // ── Response helpers ──────────────────────────────────────────────────────────
 function ok(content) { return { content }; }
 function err(msg) { return { content:[{type:'text',text:`Error: ${msg}`}], isError:true }; }
+
+// 同一标签页的写操作串行执行；读操作与 handle_dialog 不排队（manual 弹窗会卡住持锁的点击）
+const QUEUED_ACTIONS = new Set(['left_click','right_click','double_click','triple_click',
+  'type','key','scroll','scroll_to','left_click_drag','hover']);
+const QUEUED_TOOLS = new Set(['form_input','navigate','file_upload','javascript_tool']);
+
+function isQueuedCall(tool, args) {
+  if (!Number.isInteger(args?.tabId)) return false;
+  if (tool === 'computer') return QUEUED_ACTIONS.has(args.action);
+  if (tool === 'tabs') return args.action === 'reload';
+  return QUEUED_TOOLS.has(tool);
+}
 
 // ── Message router ────────────────────────────────────────────────────────────
 async function handleMessage(raw) {
@@ -1234,11 +1258,8 @@ async function handleMessage(raw) {
       sendMsg({id:msg.id, error:{code:'BAD_REQUEST',message:`Unknown tool: ${tool}`}}); return;
     }
     try {
-      const result = await Promise.race([
-        handler(args),
-        new Promise((_,rej)=>setTimeout(()=>rej(new Error(`Tool timeout: ${tool}`)),
-          EXT_TOOL_TIMEOUTS[tool] ?? TOOL_TIMEOUT)),
-      ]);
+      const run = () => withTimeout(handler(args), EXT_TOOL_TIMEOUTS[tool] ?? TOOL_TIMEOUT, tool);
+      const result = isQueuedCall(tool, args) ? await tabQueue.run(args.tabId, run) : await run();
       sendMsg({id:msg.id, result});
     } catch(e) {
       sendMsg({id:msg.id, error:{code:'INTERNAL_ERROR',message:e.message||String(e)}});
@@ -1273,22 +1294,11 @@ chrome.debugger.onEvent.addListener((src, method, params) => {
     if (buf.console.length > 1000) buf.console.shift();
   }
 
-  if (method === 'Network.requestWillBeSent') {
-    buf.network.push({
-      requestId: params.requestId,
-      method: params.request?.method||'GET',
-      url: params.request?.url||'',
-      type: params.type||'Other',
-      timestamp: Date.now(),
-      status: null, mimeType: null,
-    });
-    if (buf.network.length > 500) buf.network.shift();
-  }
-
-  if (method === 'Network.responseReceived') {
-    const req = buf.network.find(r=>r.requestId===params.requestId&&r.status===null);
-    if (req) { req.status=params.response?.status||0; req.mimeType=params.response?.mimeType||''; }
-  }
+  if (method === 'Network.requestWillBeSent') buf.network.onRequest(params, Date.now());
+  else if (method === 'Network.requestWillBeSentExtraInfo') buf.network.onExtraInfo(params);
+  else if (method === 'Network.responseReceived') buf.network.onResponse(params);
+  else if (method === 'Network.loadingFinished') buf.network.onFinished(params);
+  else if (method === 'Network.loadingFailed') buf.network.onFailed(params);
 
   if (method === 'Page.javascriptDialogOpening') {
     const dbuf = tabBuf(tabId).dialogs;
@@ -1308,17 +1318,16 @@ chrome.debugger.onDetach.addListener(src => {
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {
+  tabQueue.clear(tabId);
   traceSessions.delete(tabId);
   emulatedTabs.delete(tabId);
   tabEventBuffers.delete(tabId);
   shotScale.delete(tabId);
   cdpReady.delete(tabId);
-  csInjected.delete(tabId);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.status === 'loading') {
-    csInjected.delete(tabId);
     // trace 与 emulate 覆盖依赖同一个调试会话，加载期间不能断开，否则 reload 压测会丢数据
     if (traceSessions.has(tabId) || emulatedTabs.has(tabId)) return;
     // 页面开始加载时 CDP 会话失效，需重新附加

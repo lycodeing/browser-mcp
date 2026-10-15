@@ -108,7 +108,16 @@
     }
 
     const childAbsorbed = absorbed || ABSORB_TAGS.has(tag);
-    for (const child of el.children) walk(child, childLevel, domDepth + 1, ctx, childAbsorbed);
+    for (const child of renderedChildren(el, tag)) walk(child, childLevel, domDepth + 1, ctx, childAbsorbed);
+  }
+
+  // 按渲染后的结构取子节点：open shadow root 取其子元素，slot 取分配到它的元素（无分配则用 fallback 子节点）
+  function renderedChildren(el, tag) {
+    if (tag === 'slot') {
+      const assigned = el.assignedElements({ flatten: true });
+      return assigned.length ? assigned : el.children;
+    }
+    return el.shadowRoot ? el.shadowRoot.children : el.children;
   }
 
   globalThis.__accessibilityTree = {
