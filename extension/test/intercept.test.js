@@ -431,3 +431,109 @@ test('formatRule：三种 action 的单行描述', () => {
   assert.match(formatRule({ id: 'r4', urlPattern: '*', action: 'fulfill', status: 200, hits: 0 }), /0 headers, body 0 B/);
   assert.match(formatRule({ id: 'r5', urlPattern: '*', action: 'fulfill', status: 200, headers: { a: '1', b: '2' }, hits: 0 }), /2 headers/);
 });
+
+// ── C 批：bodyBase64 与 allow-credentials ─────────────────────────────────────
+
+test('validateRule：bodyBase64 的合法、互斥与坏输入', () => {
+  const base = { urlPattern: '*/a', action: 'fulfill' };
+  const b64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ'; // 36 字符，27 字节
+  const good = validateRule({ ...base, bodyBase64: b64, headers: { 'content-type': 'image/png' } });
+  assert.equal(good.error, undefined);
+  assert.equal(good.spec.bodyB64, b64);
+  assert.equal(good.spec.bodyBytes, 33);
+  assert.equal(good.spec.body, undefined);
+
+  assert.match(validateRule({ ...base, body: 'x', bodyBase64: b64 }).error, /not both/);
+  assert.match(validateRule({ ...base, bodyBase64: '!!!' }).error, /Invalid base64/);
+  assert.match(validateRule({ ...base, bodyBase64: 'abc' }).error, /Invalid base64/); // 长度 %4 != 0
+  assert.match(validateRule({ ...base, bodyBase64: '' }).error, /Invalid base64/);
+  assert.match(validateRule({ ...base, bodyBase64: `${'A'.repeat(4 / 3 * MAX_BODY_BYTES + 4)}`.slice(0, Math.ceil(MAX_BODY_BYTES / 3 * 4) + 4) }).error, /too large|Invalid/);
+});
+
+test('base64ByteLength：padding 计入字节数', async () => {
+  const { base64ByteLength } = await import('../lib/intercept.js');
+  assert.equal(base64ByteLength('QUJD'), 3);   // ABC
+  assert.equal(base64ByteLength('QUI='), 2);   // AB
+  assert.equal(base64ByteLength('QQ=='), 1);   // A
+  assert.equal(base64ByteLength('Q'), -1);
+  assert.equal(base64ByteLength(''), -1);
+  assert.equal(base64ByteLength(42), -1);
+  assert.equal(base64ByteLength('AB CD'), -1);
+});
+
+test('buildFulfillment：二进制 body 原样透传，不补 text/plain content-type', () => {
+  const rule = { action: 'fulfill', status: 200, headers: { 'content-type': 'image/png' }, bodyB64: 'QUJDRA==', bodyBytes: 4 };
+  const out = buildFulfillment(rule, { url: 'https://a.test/i.png', method: 'GET', headers: {} });
+  assert.equal(out.body, 'QUJDRA==');
+  assert.deepEqual(out.responseHeaders, [{ name: 'content-type', value: 'image/png' }]);
+});
+
+test('buildFulfillment：二进制且未给 content-type 时不自动补文本类型', () => {
+  const out = buildFulfillment({ action: 'fulfill', status: 200, bodyB64: 'QQ==', bodyBytes: 1 },
+    { url: 'https://a.test/i.png', method: 'GET', headers: {} });
+  assert.equal(out.responseHeaders.length, 0);
+});
+
+test('buildFulfillment：跨域请求补 allow-origin 与 allow-credentials，规则自写的不覆盖', () => {
+  const req = { url: 'https://api.test/x', method: 'GET', headers: { origin: 'https://page.test' } };
+  const out = buildFulfillment({ action: 'fulfill', status: 200, body: 'ok' }, req);
+  const h = Object.fromEntries(out.responseHeaders.map((x) => [x.name.toLowerCase(), x.value]));
+  assert.equal(h['access-control-allow-origin'], 'https://page.test');
+  assert.equal(h['access-control-allow-credentials'], 'true');
+  assert.equal(h['content-type'], 'text/plain; charset=utf-8');
+
+  const own = buildFulfillment(
+    { action: 'fulfill', status: 200, headers: { 'access-control-allow-credentials': 'false' }, body: 'ok' }, req);
+  const h2 = Object.fromEntries(own.responseHeaders.map((x) => [x.name.toLowerCase(), x.value]));
+  assert.equal(h2['access-control-allow-credentials'], 'false');
+});
+
+test('buildPreflightResponse：带 Origin 时回显并补 allow-credentials，无 Origin 用 *', () => {
+  const withOrigin = buildPreflightResponse({
+    method: 'OPTIONS',
+    headers: { origin: 'https://page.test', 'access-control-request-method': 'POST' },
+  });
+  const h = Object.fromEntries(withOrigin.responseHeaders.map((x) => [x.name.toLowerCase(), x.value]));
+  assert.equal(h['access-control-allow-origin'], 'https://page.test');
+  assert.equal(h['access-control-allow-credentials'], 'true');
+
+  const noOrigin = buildPreflightResponse({ method: 'OPTIONS', headers: { 'access-control-request-method': 'POST' } });
+  const h2 = Object.fromEntries(noOrigin.responseHeaders.map((x) => [x.name.toLowerCase(), x.value]));
+  assert.equal(h2['access-control-allow-origin'], '*');
+  assert.equal(h2['access-control-allow-credentials'], undefined);
+});
+
+test('formatRule：二进制规则显示字节数不显示内容', () => {
+  assert.equal(
+    formatRule({ id: 'r9', urlPattern: '*/i.png', action: 'fulfill', status: 200, bodyB64: 'QUJDRA==', bodyBytes: 4, hits: 0 }),
+    'r9  */i.png  ->  fulfill 200, 0 headers, body 4 B (binary)  hits=0',
+  );
+});
+
+test('快照往返：bodyB64 规则 dump/load 后保留二进制形态', () => {
+  const a = createInterceptStore();
+  const b64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ';
+  a.add(1, spec({ urlPattern: '*/i.png', action: 'fulfill', bodyBase64: b64, headers: { 'content-type': 'image/png' } }));
+  const dump = a.dump();
+
+  const b = createInterceptStore();
+  b.load(dump);
+  const rule = b.list(1)[0];
+  assert.equal(rule.bodyB64, b64);
+  assert.equal(rule.bodyBytes, 33);
+  assert.equal(rule.body, undefined);
+  // load 后命中时走二进制通路
+  const plan = planResponse(b, 1, { url: 'https://a.test/i.png', method: 'GET', headers: {} });
+  assert.equal(plan.params.body, b64);
+});
+
+test('load 时坏 bodyB64 的条目被跳过', () => {
+  const store = createInterceptStore();
+  store.load({ v: 1, tabs: { 1: { nextId: 2, active: false, rules: [
+    { id: 'r1', urlPattern: '*/a', action: 'fulfill', bodyBase64: '%%%', hits: 0 },
+    { id: 'r2', urlPattern: '*/b', action: 'fulfill', body: 'ok', hits: 0 },
+  ] } } });
+  const rules = store.list(1);
+  assert.equal(rules.length, 1);
+  assert.equal(rules[0].id, 'r2');
+});
