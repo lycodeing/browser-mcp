@@ -6,13 +6,13 @@
 
 **让 AI 助手直接操控你正在用的 Chrome。**
 
-一个 Chrome 扩展 + 本地 MCP Relay，把浏览器能力以 21 个工具的形式提供给 ZCode、Claude Code、pi 等任何支持 MCP 的客户端。
+一个 Chrome 扩展 + 本地 MCP Relay，把浏览器能力以 19 个工具的形式提供给 ZCode、Claude Code、pi 等任何支持 MCP 的客户端。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white)
 ![Chrome MV3](https://img.shields.io/badge/Chrome-Manifest%20V3-4285F4?logo=googlechrome&logoColor=white)
 ![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-8A2BE2)
-![Tools](https://img.shields.io/badge/tools-21-orange)
+![Tools](https://img.shields.io/badge/tools-19-orange)
 
 [GitHub](https://github.com/lycodeing/browser-mcp) · [Gitee 镜像](https://gitee.com/lycodeing/browser-mcp)
 
@@ -27,7 +27,8 @@
 - **省 token**：截图按 CSS 像素输出并限制长边，页面树只保留可见元素，超大图片自动落盘只回传路径。
 - **不容易卡死**：JS 弹窗自动应答，扩展断线后按递增间隔自动重连，CDP 暂时拒绝时自动重试。
 - **宽松入参**：模型把数字、布尔、坐标写成字符串（`"123"`、`"[601, 385]"`）也能正常调用。
-- **多 agent 并发**：多个 agent 同时操作不同标签页互不干扰。
+- **多 agent 并发**：多个 agent 同时操作不同标签页互不干扰；同一标签页上的写操作（点击、输入、导航等）自动排队，读操作不排队。`tabs` 的 `group` 参数让每个 agent 的标签页归入自己的彩色标签组，一眼看出谁在用哪个页面。
+- **iframe 与 Shadow DOM**：`read_page`、`find`、`form_input`、`computer` 自动覆盖所有 frame 并进入 open shadow root，子 frame 的 ref 带前缀（如 `f3.ref_7`），调用方式不变。
 
 ## 工作原理
 
@@ -44,7 +45,7 @@ Relay 对 AI 一侧暴露 MCP 端点，对浏览器一侧运行 WebSocket 服务
 
 ## 功能一览
 
-21 个工具，按用途分四组。
+19 个工具，按用途分四组。
 
 ### 页面交互与读取
 
@@ -64,9 +65,7 @@ Relay 对 AI 一侧暴露 MCP 端点，对浏览器一侧运行 WebSocket 服务
 
 | 工具 | 功能 |
 |------|------|
-| `tabs_context` | 列出所有已打开的标签页 |
-| `tabs_create` | 新建标签页 |
-| `tabs_close` | 关闭标签页 |
+| `tabs` | 标签页与标签组管理，按 `action` 区分：`list` 列出（显示所属组、窗口、是否激活）、`create` 新建（可带 `url`、`active`、`group`）、`close` 批量关闭、`activate` 切到前台、`reload` 重载、`duplicate` 复制、`group` 归组或取消分组 |
 | `resize_window` | 调整浏览器窗口大小 |
 
 ### 调试与观测
@@ -75,7 +74,7 @@ Relay 对 AI 一侧暴露 MCP 端点，对浏览器一侧运行 WebSocket 服务
 |------|------|
 | `javascript_tool` | 在页面上下文中执行 JavaScript |
 | `read_console_messages` | 读取控制台日志缓冲，可按正则和级别过滤 |
-| `read_network_requests` | 读取网络请求缓冲，可按 URL 过滤 |
+| `network` | `list` 读取网络请求缓冲，每条带序号，失败请求显示原因（连接重置、CORS、被拦截等），可按 URL、方法、状态码（`404`、`4xx`、`500-599`）和 `failedOnly` 过滤；`detail` 按序号取请求头、响应头、POST 体和响应体，响应体超过 `bodyLimit` 时截断，可用 `saveTo` 落盘 |
 | `performance` | `metrics` 即时读取 LCP / CLS / INP / FCP / TTFB、JS 堆、DOM 节点数、监听器数、最慢资源；`trace_start` / `trace_stop` 录制 Chrome trace，返回长任务、阻塞时间、主线程耗时分布和最重脚本 |
 | `emulate` | CPU 降速、网络限速（Slow 3G / Fast 3G / Fast 4G / Offline）、深浅色模式、User-Agent 覆盖，`reset:true` 还原 |
 
@@ -197,7 +196,7 @@ claude mcp add --transport http browser http://127.0.0.1:3000/mcp
 对 AI 说"打开 example.com，截个图，然后点击 Submit 按钮"，它会按下面的顺序调用工具：
 
 ```
-tabs_context                                      → 拿到 tabId
+tabs      { action: "list" }                      → 拿到 tabId
 navigate  { tabId, url: "https://example.com" }   → 打开页面
 computer  { action: "screenshot", tabId }         → 看一眼当前状态
 find      { tabId, query: "Submit" }              → 拿到 ref_42
@@ -206,7 +205,7 @@ computer  { action: "left_click", tabId, ref: "ref_42" }
 
 更多场景：
 
-- **排查前端问题**：`read_console_messages` 看报错，`read_network_requests` 看失败的请求，`javascript_tool` 现场执行代码。
+- **排查前端问题**：`read_console_messages` 看报错，`network` 看失败的请求及原因，再用 `detail` 取响应体，`javascript_tool` 现场执行代码。
 - **性能与弱网测试**：先用 `emulate` 限速并降 CPU，再用 `performance` 抓指标或录 trace。
 - **表单与文件**：`form_input` 填字段，`file_upload` 传文件，`save_pdf` 把结果导出。
 
@@ -227,14 +226,18 @@ EXT_PORT=16789 MCP_PORT=3000 npm start
 
 - Relay 的两个服务都只监听 `127.0.0.1`，局域网内其他机器连不上。
 - **没有鉴权**：本机上的任何进程都能调用 MCP 端点，进而操作你的浏览器，包括读取 Cookie 和执行页面脚本。请只在你信任的环境里运行，不要把端口转发或暴露出去。
+- `network` 的 `detail` 能读取页面请求的头、POST 体和响应体，与 `cookies` 工具同级敏感。`authorization`、`cookie` 等请求头默认显示为 `****`，传 `rawHeaders:true` 才原样输出。
 - 扩展申请了 `debugger`、`cookies`、`<all_urls>` 等较大的权限，这是实现截图、网络监听和 Cookie 管理所必需的。
 
 ## 开发
 
 ```bash
 cd relay
-npm test    # node --test，覆盖入参宽松校验
+npm test    # node --test，覆盖入参宽松校验、工具清单、超时联动、saveTo 落盘
 npm run dev # 文件变化后自动重启
+
+cd ../extension
+npm test    # node --test，覆盖串行队列、标签页与标签组、网络缓冲等纯逻辑模块
 ```
 
 图标源图由 `extension/icons/generate_icon_source.py` 生成，再用 `resize_icons.py` 缩放出 16 / 48 / 128 三个尺寸。
@@ -254,7 +257,10 @@ browser-mcp/
 │       └── mcp-server.js       # MCP HTTP 服务（AI 侧）
 └── extension/                  # Chrome 扩展 (Manifest V3)
     ├── manifest.json
-    ├── background.js           # Service Worker，工具实现
+    ├── background.js           # Service Worker，工具实现与消息路由
+    ├── lib/                    # 纯逻辑模块（队列、URL、标签组、超时），可用 node --test 测试
+    ├── tools/                  # 依赖 chrome.* 的工具实现，依赖通过参数注入
+    ├── test/
     ├── popup.html / popup.js   # 状态弹窗
     ├── icons/
     └── content-scripts/
@@ -274,10 +280,10 @@ browser-mcp/
 确认 `http://127.0.0.1:3000/mcp` 可访问，然后重启客户端。
 
 **`computer`、`javascript_tool` 等调用报 CDP attach 失败**
-页面刚跳转或重载时，Chrome 会短暂拒绝调试器附加，扩展会自动重试，共尝试 4 次。仍失败时等几秒再试，或用 `tabs_create` 新开标签页。`read_page`、`find`、`form_input`、`get_page_text` 不依赖调试器，这时仍可使用。
+页面刚跳转或重载时，Chrome 会短暂拒绝调试器附加，扩展会自动重试，共尝试 4 次。仍失败时等几秒再试，或用 `tabs`（`action:"create"`）新开标签页。`read_page`、`find`、`form_input`、`get_page_text` 不依赖调试器，这时仍可使用。
 
 **同一个标签页被多个 agent 同时操作**
-不同标签页之间完全隔离，但同一标签页上的并发点击、输入结果不可预测。请让每个 agent 使用各自的标签页。
+同一标签页上的写操作（点击、输入、按键、滚动、导航、`form_input`、`javascript_tool` 等）按先后顺序排队执行，排队超过 30 秒返回"标签页忙"；读操作（`read_page`、`find`、截图、日志等）不排队。排队只保证单次调用的原子性，不保证两个 agent 的操作逻辑不冲突，所以仍建议每个 agent 使用各自的标签页，并用 `tabs` 的 `group` 参数归入各自的标签组。
 
 ## 参与贡献
 

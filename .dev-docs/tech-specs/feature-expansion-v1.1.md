@@ -2,6 +2,8 @@
 
 > 状态：待确认 → 确认后编码
 > 范围：截图增强 / 自动化可靠性 / PDF 导出 / Cookie 与下载管理
+>
+> **后续变更（v2.0）**：A 批（`batch-a-design-v2.0.md`）已取代本文中的以下内容：`tabs_context` / `tabs_create` / `tabs_close` 合并为 `tabs`；`read_network_requests` 由 `network` 取代；`read_page` / `find` 自动合并 iframe 与 open shadow root；同标签页写操作按 tabId 串行。本文其余章节仍然有效，历史章节不做改写。
 
 ## 1. 背景与现状
 
