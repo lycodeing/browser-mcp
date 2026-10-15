@@ -215,7 +215,7 @@ r3  delay 3000ms  POST */api/search*            hits 0
       做法：规则存进 <code>chrome.storage.session</code>，Service Worker 恢复后重新加载；恢复不了就主动关闭拦截。</div>
     <div class="card"><b>风险二：页面跳转会断开调试器</b><br>现有代码在页面开始加载时会断开调试器，只有 trace 和 emulate 的标签页例外。拦截规则也要加进这个例外，否则跳转一次规则就失效。</div>
   </div>
-  <div class="note"><code>fulfill</code> 的响应体先只支持文本。二进制响应体（图片等）留到后续批次。</div>
+  <div class="note">原文：fulfill 响应体只支持文本，二进制留到后续批次 —— <b>C 批 v2.2 已补齐</b>（bodyBase64），跨域带凭据的 Mock 也已自动补 access-control-allow-credentials。</div>
 </section>
 
 <section id="s5">

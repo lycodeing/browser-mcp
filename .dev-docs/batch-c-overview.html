@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>browser-mcp C 批：frame 全覆盖与拦截增强 · 功能介绍与示意图</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --ink: #1c2230; --muted: #667085; --line: #e3e6ec;
+    --brand: #4f46e5; --brand-soft: #eef0ff;
+    --green: #16a34a; --green-soft: #e8f7ee;
+    --red: #dc2626; --red-soft: #fdeceb;
+    --amber: #b45309; --amber-soft: #fdf3e1;
+    --blue: #2563eb; --orange: #ea580c; --pink: #db2777;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.7 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { background: #1c2230; color: #fff; padding: 40px 24px 32px; }
+  header .wrap, main { max-width: 1040px; margin: 0 auto; }
+  header h1 { margin: 0 0 8px; font-size: 26px; }
+  header p { margin: 0; color: #b8c0d4; }
+  .badge { display: inline-block; padding: 1px 10px; border-radius: 999px; font-size: 12px;
+    background: #ffffff22; color: #dfe4f3; margin-bottom: 12px; }
+  nav { position: sticky; top: 0; z-index: 5; background: #fffd; backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line); }
+  nav .wrap { max-width: 1040px; margin: 0 auto; padding: 8px 24px; display: flex; gap: 18px; flex-wrap: wrap; }
+  nav a { color: var(--muted); text-decoration: none; font-size: 13px; }
+  nav a:hover { color: var(--brand); }
+  main { padding: 28px 24px 80px; }
+  section { margin-bottom: 36px; }
+  h2 { font-size: 20px; margin: 0 0 4px; }
+  h2 .no { color: var(--brand); margin-right: 8px; }
+  .lead { color: var(--muted); margin: 0 0 16px; }
+  h3 { font-size: 15px; margin: 20px 0 8px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; }
+  .grid { display: grid; gap: 14px; }
+  .g4 { grid-template-columns: repeat(4, 1fr); }
+  .g3 { grid-template-columns: repeat(3, 1fr); }
+  .g2 { grid-template-columns: repeat(2, 1fr); }
+  @media (max-width: 760px) { .g4, .g3, .g2 { grid-template-columns: 1fr; } }
+  .stat .n { font-size: 30px; font-weight: 700; color: var(--brand); line-height: 1.2; }
+  .stat .t { color: var(--muted); font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; background: #fafbfc; }
+  code, pre { font-family: var(--mono); font-size: 12.5px; }
+  code { background: #eef0f4; padding: 1px 6px; border-radius: 4px; }
+  pre { margin: 0; background: #151a26; color: #d6dcec; padding: 14px 16px; border-radius: 10px;
+    overflow-x: auto; line-height: 1.6; }
+  pre .c { color: #7d879f; } pre .k { color: #8fb4ff; } pre .ok { color: #6ee7a0; }
+  pre .bad { color: #ff8a80; } pre .warn { color: #ffd07a; }
+  .tag { display: inline-block; font-size: 12px; padding: 0 8px; border-radius: 6px; font-weight: 600; }
+  .t-del { background: var(--red-soft); color: var(--red); }
+  .t-new { background: var(--green-soft); color: var(--green); }
+  .t-up { background: var(--brand-soft); color: var(--brand); }
+  .note { border-left: 3px solid var(--amber); background: var(--amber-soft); color: #7a4a0c;
+    padding: 10px 14px; border-radius: 0 8px 8px 0; margin-top: 14px; font-size: 14px; }
+  .cap { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+  ul { margin: 6px 0; padding-left: 20px; }
+
+  /* frame 路由示意 */
+  .framebox { background: #fff; border: 2px solid #2b3245; border-radius: 10px; padding: 12px 14px 16px; }
+  .framebox .bar { font-size: 12px; color: var(--muted); border-bottom: 1px dashed var(--line);
+    padding-bottom: 6px; margin-bottom: 10px; }
+  .nested { border: 2px dashed #7d879f; border-radius: 8px; padding: 10px 12px 12px; margin-top: 10px; background: #fafbfc; }
+  .nested .bar { border-bottom: 1px dashed var(--line); font-size: 12px; color: var(--muted); padding-bottom: 4px; }
+  .framerow { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; align-items: start; }
+
+  .flow { display: flex; align-items: stretch; gap: 8px; flex-wrap: wrap; }
+  .step { flex: 1; min-width: 140px; background: #fff; border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 12px; font-size: 13px; }
+  .step b { display: block; font-size: 12px; color: var(--brand); margin-bottom: 2px; }
+  .arrow { align-self: center; color: var(--muted); font-size: 18px; }
+
+  .ask { background: var(--brand-soft); border: 1px solid #d6dafc; border-radius: 12px; padding: 18px 20px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <span class="badge">v2.2 · 已实现 · 自动测试通过（relay 28 / ext 229）</span>
+    <h1>browser-mcp C 批：frame 全覆盖与拦截增强</h1>
+    <p>三个工具补齐 iframe 支持 · fulfill 二进制响应体 · 带凭据的跨域 Mock</p>
+  </div>
+</header>
+
+<nav><div class="wrap">
+  <a href="#s1">1 总览</a><a href="#s2">2 现状与差距</a><a href="#s3">3 三个工具怎么改</a>
+  <a href="#s4">4 拦截增强</a><a href="#s5">5 默认选择与风险</a>
+</div></nav>
+
+<main>
+
+<section id="s1">
+  <h2><span class="no">1</span>总览</h2>
+  <p class="lead">下面所有输出文本都是示意，真实格式以技术文档和实现为准。本批不新增工具，只增强既有工具；工具总数保持 23。</p>
+  <div class="grid g4">
+    <div class="card stat"><div class="n">23 → 23</div><div class="t">工具总数不变，5 个工具增强</div></div>
+    <div class="card stat"><div class="n">3</div><div class="t">补齐 iframe：get_page_text、javascript_tool、file_upload</div></div>
+    <div class="card stat"><div class="n">2</div><div class="t">intercept 增强：二进制 body、带凭据跨域</div></div>
+    <div class="card stat"><div class="n">0</div><div class="t">新增工具、权限与 npm 依赖</div></div>
+  </div>
+  <div class="note">本批来自 A、B 批文档里明确写"留到后续批次"的遗留项，没有新功能提案。工具接口完全向后兼容：旧调用（不带 frame 参数）行为不变。</div>
+</section>
+
+<section id="s2">
+  <h2><span class="no">2</span>现状与差距</h2>
+  <p class="lead">A 批让 read_page / find / form_input / computer 覆盖了所有 frame，但还有三个工具留在主 frame。</p>
+
+  <div class="card" style="padding:0;overflow:hidden">
+  <table>
+    <tr><th style="width:210px">工具</th><th style="width:130px">现状</th><th>差距场景</th></tr>
+    <tr><td><code>get_page_text</code></td><td><span class="tag t-del">只主 frame</span></td><td>正文在 iframe 里的页面（嵌入式文档、富文本预览、三方组件）读到空或残缺</td></tr>
+    <tr><td><code>javascript_tool</code></td><td><span class="tag t-del">只主 frame</span></td><td>想探查某个 iframe 的 DOM / 变量，只能手写 <code>window.frames[i]</code>，跨域 frame 直接拒绝</td></tr>
+    <tr><td><code>file_upload</code></td><td><span class="tag t-del">拒绝子 frame</span></td><td>上传控件在 iframe 里（支付收银台、老后台）时直接报错，无法继续</td></tr>
+    <tr><td><code>intercept_add</code> body</td><td><span class="tag t-del">只文本</span></td><td>Mock 图片、字体、PDF 等二进制资源做不到</td></tr>
+    <tr><td><code>intercept_add</code> CORS</td><td><span class="tag t-del">不带凭据</span></td><td>带 cookie/token 的跨域 fetch 被 Mock 时，响应缺 <code>allow-credentials</code>，浏览器拒收</td></tr>
+  </table>
+  </div>
+
+  <h3>frame 路由示意：ref 前缀已经存在</h3>
+  <div class="card">
+    <div class="framebox">
+      <div class="bar">主 frame（frameId 0）· http://a.com</div>
+        按钮 <code>ref_12</code> · 输入框 <code>ref_13</code>
+        <div class="nested">
+          <div class="bar">子 frame（frameId 3）· http://b.com（跨域）</div>
+          上传控件 <code><b>f3.ref_7</b></code> · 正文文本（get_page_text 目前读不到）
+        </div>
+    </div>
+    <p class="cap">A 批已建好这套前缀路由（read_page / find 的输出里，子 frame 元素都带 <code>f&lt;frameId&gt;.</code> 前缀）。C 批只是让剩下三个工具也认得它。</p>
+  </div>
+</section>
+
+<section id="s3">
+  <h2><span class="no">3</span>三个工具怎么改</h2>
+  <p class="lead">入口方式统一：能定位元素的用 ref 前缀路由；纯"对哪一层执行"的用新参数 <code>frameId</code>。</p>
+
+  <div class="card" style="padding:0;overflow:hidden">
+  <table>
+    <tr><th style="width:190px">工具</th><th style="width:250px">怎么指定 frame</th><th>行为</th></tr>
+    <tr><td><code>get_page_text</code></td><td>新参数 <code>frameId</code>（可选）</td><td>不传＝现状（主 frame 正文）。传了＝只提取那个 frame 的正文。另加 <code>allFrames:true</code> 合并所有 frame 的文本，各段带 frame 标头</td></tr>
+    <tr><td><code>javascript_tool</code></td><td>新参数 <code>frameId</code>（可选）</td><td>不传＝主 frame（现状）。传子 frame 的 id＝在该 frame 上下文执行，<code>location</code>、<code>document</code> 都是那个 frame 的</td></tr>
+    <tr><td><code>file_upload</code></td><td>ref 本身带前缀，<b>无需新参数</b></td><td><code>ref: "f3.ref_7"</code> 直接可用：在对应 frame 里找 input、设文件；触发式（<code>triggerRef</code>）同理</td></tr>
+  </table>
+  </div>
+
+  <h3>输出示意</h3>
+<pre><span class="k">read_page</span> { tabId: 101, filter: "interactive" }          <span class="c">→ 列表里有 f3.ref_7（上传控件）</span>
+
+<span class="k">file_upload</span> { tabId: 101, ref: "f3.ref_7", paths: ["/tmp/a.png"] }
+<span class="ok">File(s) set on input f3.ref_7: /tmp/a.png</span>            <span class="c">← 原来这里报 "does not support elements inside iframes yet"</span>
+
+<span class="k">javascript_tool</span> { tabId: 101, frameId: 3, text: "document.querySelectorAll('input').length" }
+<span class="ok">2</span>
+
+<span class="k">get_page_text</span> { tabId: 101, allFrames: true }
+Title: 订单页
+URL: http://a.com
+
+…正文…
+
+<span class="ok">Frame f3 (http://b.com):</span>
+…正文…
+
+(2 frames merged)</pre>
+  <p class="cap">合并输出里主 frame 在前，子 frame 按 frameId 升序；空文本的 frame 跳过。总量受 <code>max_chars</code> 约束（对全部 frame 合计），超了会截断并提示。</p>
+
+  <div class="flow" style="margin-top:14px">
+    <div class="step"><b>1 解析目标</b>ref 前缀或 frameId 参数</div><div class="arrow">→</div>
+    <div class="step"><b>2 定向注入</b>按 frameIds 执行脚本（A 批已有 runInRefFrame）</div><div class="arrow">→</div>
+    <div class="step"><b>3 frame 不存在</b>返回明确报错：frame 已跳转，请重新 read_page</div>
+  </div>
+  <p class="cap">CDP 兜底路径（javascript_tool 的 Runtime.evaluate）同步升级：走 Frame 定位执行，而不是只打主 frame。</p>
+</section>
+
+<section id="s4">
+  <h2><span class="no">4</span>拦截增强</h2>
+  <p class="lead">两个 B 批明确记录的限制，都在 lib/intercept.js 纯逻辑层解决。</p>
+
+  <h3>二进制响应体</h3>
+  <div class="card">
+<pre><span class="k">intercept_add</span> { tabId: 101, urlPattern: "*/avatar.png*", action: "fulfill",
+                 status: 200, headers: { "content-type": "image/png" },
+                 bodyBase64: "iVBORw0KGgoAAAANSUhEUg…" }
+
+<span class="ok">Rule r4 added</span>  */avatar.png*  ->  fulfill 200, 1 header, body 4.2 KB (binary)</pre>
+    <ul style="margin-top:12px">
+      <li>新字段 <code>bodyBase64</code>：内容就是 base64，原样交给 CDP（CDP 的 <code>Fetch.fulfillRequest</code> 本来就收 base64，浏览器侧零改动）</li>
+      <li>与 <code>body</code> 互斥，同时传报错；解码后大小上限沿用 1 MB</li>
+      <li>入库前校验 base64 合法性，坏输入在 <code>intercept_add</code> 就报错，不会等到请求命中才失败</li>
+      <li><code>intercept_list</code> 对二进制 body 显示字节数，不显示内容</li>
+    </ul>
+  </div>
+
+  <h3>带凭据的跨域 Mock</h3>
+  <div class="card">
+    <div class="flow">
+      <div class="step"><b>1 跨域 fetch 带 cookie</b>页面请求 <code>credentials:"include"</code></div><div class="arrow">→</div>
+      <div class="step"><b>2 Mock 响应补头</b>自动加 <code>access-control-allow-credentials: true</code></div><div class="arrow">→</div>
+      <div class="step"><b>3 浏览器放行</b>页面正常拿到 Mock 数据</div>
+    </div>
+    <ul style="margin-top:12px">
+      <li>请求带 <code>Origin</code> 且响应需要凭据时，自动补 <code>access-control-allow-credentials: true</code>（allow-origin 保持回显 Origin，不用 <code>*</code>——规范禁止 <code>*</code> 与 credentials 同用）</li>
+      <li>CORS 预检的自动应答同样补这个头</li>
+      <li>规则自己写了 CORS 头时不覆盖，以规则为准</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s5">
+  <h2><span class="no">5</span>默认选择与风险</h2>
+  <div class="grid g2">
+    <div class="card"><b>我替你做的默认选择（可推翻）</b><ul>
+      <li>不新增工具，全部是既有工具的增强，接口向后兼容</li>
+      <li>frame 定位用 ref 前缀优先，纯执行类的加 <code>frameId</code> 参数</li>
+      <li><code>get_page_text</code> 默认行为不变（主 frame），合并模式要显式传 <code>allFrames:true</code></li>
+      <li>二进制 body 用独立的 <code>bodyBase64</code> 字段，不复用 <code>body</code>（类型语义清晰，出问题好排查）</li>
+      <li><code>allow-credentials</code> 自动补，仅当跨域且请求真的带凭据特征时</li>
+      <li>老工具实现从 background.js 搬进 lib/ + tools/ 分层，与 B 批结构一致</li></ul></div>
+    <div class="card"><b>风险与待验证</b><ul>
+      <li><code>DOM.setFileInputFiles</code> 对子 frame 节点的定位方式需要实验证实（页面级 CDP 命令，子 frame 的 DOM 树要拿到正确的执行上下文）</li>
+      <li><code>javascript_tool</code> 的 CDP 兜底在子 frame 的行为（Runtime.evaluate + frame 定位）需要实测</li>
+      <li>file_upload 触发式（intercept file chooser）在子 frame 点击时，点击坐标换算复用 A 批的跨域握手，理论上没问题，仍要手测</li>
+      <li>大 body 的 base64 在 Service Worker 与 WS 链路上的体积（1 MB base64 约 1.4 MB 文本）要过一遍超时与消息上限</li>
+      <li>工具描述文案要更新（README、schema description），总数不变</li></ul></div>
+  </div>
+</section>
+
+<div class="note">全部按建议执行（用户已确认，不考虑兼容包袱）。设计文档见 <code>tech-specs/batch-c-design-v2.2.md</code>。手测进行中：扩展重载按钮在本机无法通过自动化点击触发，等用户在 chrome://extensions 手动点一次"重新加载"后完成手测清单。</div>
+
+</main>
+</body>
+</html>

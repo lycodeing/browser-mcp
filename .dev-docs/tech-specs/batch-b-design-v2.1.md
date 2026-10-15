@@ -425,9 +425,9 @@ X2、X4、X5、X6 不依赖扩展，在本机 Chrome 155 的无头临时 profile
 | `Browser` 域被拒仅是文档结论 | 可能文档过时 | 实验 X1 先证实 |
 | `setLocaleOverride` 是实验性方法 | 格式或行为可能变化 | 实验 X4；失败时报错而不是静默忽略 |
 | 地理位置无法代替授权 | 无权限站点读不到位置 | 结果里固定提示，工具描述写明 |
-| `Accept-Language` 请求头不随 `locale` 改变 | 服务端按请求头判断语言的站点看不到变化 | 写入已知限制 |
-| `fulfill` 只支持文本 | 图片等二进制不支持 | 写入已知限制，后续批次 |
-| 带凭据的跨域 Mock | `access-control-allow-credentials` 不处理 | 写入已知限制 |
+| ~~`Accept-Language` 请求头不随 `locale` 改变~~（已过时） | 实现实际通过 `setUserAgentOverride` 的 `acceptLanguage` 同步改了请求头（见 tools/emulate.js），README 描述正确；C 批核对时修正本文 | 已实现，非限制 |
+| ~~`fulfill` 只支持文本~~（C 批已解决） | `bodyBase64` 支持二进制响应体 | C 批 v2.2 |
+| ~~带凭据的跨域 Mock~~（C 批已解决） | 自动补 `access-control-allow-credentials: true` | C 批 v2.2 |
 | `storage` 只作用于主 frame 的源 | iframe 内的存储读不到 | 工具描述写明 |
 | 登录态可被改写 | `storage set` 可直接改 token | 与 `cookies` 同级，README 安全说明写明；本机无鉴权的前提沿用 |
 | 工具数 23 个 | 每个工具描述占用上下文 | 描述保持简短；已知代价 |

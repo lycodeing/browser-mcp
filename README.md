@@ -28,7 +28,7 @@
 - **不容易卡死**：JS 弹窗自动应答，扩展断线后按递增间隔自动重连，CDP 暂时拒绝时自动重试。
 - **宽松入参**：模型把数字、布尔、坐标写成字符串（`"123"`、`"[601, 385]"`）也能正常调用。
 - **多 agent 并发**：多个 agent 同时操作不同标签页互不干扰；同一标签页上的写操作（点击、输入、导航等）自动排队，读操作不排队。`tabs` 的 `group` 参数让每个 agent 的标签页归入自己的彩色标签组，一眼看出谁在用哪个页面。
-- **iframe 与 Shadow DOM**：`read_page`、`find`、`form_input`、`computer` 自动覆盖所有 frame 并进入 open shadow root，子 frame 的 ref 带前缀（如 `f3.ref_7`），调用方式不变。
+- **iframe 与 Shadow DOM**：`read_page`、`find`、`form_input`、`computer`、`get_page_text`、`file_upload` 自动覆盖所有 frame 并进入 open shadow root，子 frame 的 ref 带前缀（如 `f3.ref_7`），调用方式不变；`javascript_tool`、`get_page_text` 也可用 `frameId` 定向到某个 iframe。
 
 ## 工作原理
 
@@ -56,8 +56,8 @@ Relay 对 AI 一侧暴露 MCP 端点，对浏览器一侧运行 WebSocket 服务
 | `find` | 按关键词搜索页面元素，返回可直接点击的 `ref` |
 | `form_input` | 填写 input / select / textarea / contenteditable |
 | `navigate` | 跳转 URL、前进后退、处理 `beforeunload` |
-| `get_page_text` | 提取页面正文纯文本 |
-| `file_upload` | 把本地文件上传到页面的文件选择器 |
+| `get_page_text` | 提取页面正文纯文本；默认主 frame，`frameId` 定向提取某个 iframe，`allFrames:true` 合并所有 frame（各段带 frame 标头，总量受 `max_chars` 约束） |
+| `file_upload` | 把本地文件上传到页面的文件选择器；`ref` 与 `triggerRef` 都支持 iframe 的 ref（如 `f3.ref_7`） |
 | `wait_for` | 等待元素出现或消失、URL 变化、网络空闲或固定时长，替代盲等 |
 | `handle_dialog` | 应答 alert / confirm / prompt，配合 `dialog:"manual"` 使用 |
 
@@ -72,12 +72,12 @@ Relay 对 AI 一侧暴露 MCP 端点，对浏览器一侧运行 WebSocket 服务
 
 | 工具 | 功能 |
 |------|------|
-| `javascript_tool` | 在页面上下文中执行 JavaScript |
+| `javascript_tool` | 在页面上下文中执行 JavaScript；`frameId` 可指定在某个 iframe 里执行（`document`、`location` 都是那个 frame 的） |
 | `read_console_messages` | 读取控制台日志缓冲，可按正则和级别过滤 |
 | `network` | `list` 读取网络请求缓冲，每条带序号，失败请求显示原因（连接重置、CORS、被拦截等），可按 URL、方法、状态码（`404`、`4xx`、`500-599`）和 `failedOnly` 过滤；`detail` 按序号取请求头、响应头、POST 体和响应体，响应体超过 `bodyLimit` 时截断，可用 `saveTo` 落盘 |
 | `performance` | `metrics` 即时读取 LCP / CLS / INP / FCP / TTFB、JS 堆、DOM 节点数、监听器数、最慢资源；`trace_start` / `trace_stop` 录制 Chrome trace，返回长任务、阻塞时间、主线程耗时分布和最重脚本 |
 | `emulate` | 设备预设（`iphone-15` / `ipad-air` / `pixel-8`）或自定义宽高、像素比、移动端；地理位置、时区、语言；CPU 降速、网络限速（Slow 3G / Fast 3G / Fast 4G / Offline）、深浅色模式、User-Agent 覆盖，`reset:true` 一键还原。地理位置只有在站点已获得定位权限时页面才读得到，本工具无法授予权限 |
-| `intercept_add` | 对标签页的请求加规则（按 URL 通配符，可限定方法）：`fail` 模拟网络错误、`fulfill` 返回 Mock 响应、`delay` 延迟放行。跨域 Mock 自动补 `access-control-allow-origin` 并应答 CORS 预检，每个标签页最多 50 条，先匹配到的规则生效 |
+| `intercept_add` | 对标签页的请求加规则（按 URL 通配符，可限定方法）：`fail` 模拟网络错误、`fulfill` 返回 Mock 响应、`delay` 延迟放行。跨域 Mock 自动补 `access-control-allow-origin` 与 `access-control-allow-credentials` 并应答 CORS 预检，`body` 为文本响应体、`bodyBase64` 为二进制（如图片，解码后上限 1 MB），每个标签页最多 50 条，先匹配到的规则生效 |
 | `intercept_list` | 列出标签页的规则、命中次数，以及拦截当前是否生效 |
 | `intercept_remove` | 按 id 删除一条规则，不传 `ruleId` 则清空并关闭拦截 |
 
