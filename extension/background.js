@@ -11,6 +11,7 @@ import { createEmulateTool } from './tools/emulate.js';
 import { createStorageTool } from './tools/storage.js';
 import { createInterceptStore } from './lib/intercept.js';
 import { createInterceptTools } from './tools/intercept.js';
+import { createPageTools } from './tools/page-tools.js';
 import {
   parseRef, mergeFrameTrees, mergeFindResults, formatFindLines, resolveFrameOffset, toTopPoint,
 } from './lib/frames.js';
@@ -646,141 +647,6 @@ function waitForLoad(tabId, timeoutMs) {
   });
 }
 
-async function toolJavascript(args) {
-  const {tabId, text} = args;
-  if (!tabId) return err('tabId required');
-  if (!text) return err('text required');
-  if (text.length > 100000) return err('Code too long (max 100000 chars)');
-  await ensureCdp(tabId);
-
-  // Try scripting API first, fall back to CDP
-  try {
-    const [r] = await chrome.scripting.executeScript({
-      target:{tabId},
-      func:code=>{
-        // 检测语句关键字开头，跳过 (expr) 表达式尝试，省一次失败 eval
-        const isStmt = /^(const|let|var|function|class|if|for|while|switch|try|throw|return|do|export|import)\b/.test(code.trim());
-        try {
-          if (!isStmt) return {ok:true,v:(0,eval)(`(${code})`)};
-          (0,eval)(code); return {ok:true,v:undefined};
-        } catch(e) { return {ok:false,e:e.message} }
-      },
-      args:[text],
-    });
-    const res = r?.result;
-    if (res?.ok === false) throw new Error(res.e);
-    const out = formatJsResult(res?.v);
-    return ok([{type:'text',text:out.length>50000?out.slice(0,50000)+'\n...[truncated]':out}]);
-  } catch {
-    // CDP fallback
-    const cdpRes = await chrome.debugger.sendCommand({tabId},'Runtime.evaluate',
-      {expression:`(${text})`,returnByValue:true,awaitPromise:true});
-    if (cdpRes.exceptionDetails) {
-      const msg = cdpRes.exceptionDetails.exception?.description || cdpRes.exceptionDetails.text;
-      // If expression syntax error, wrap as statement
-      if (/SyntaxError/.test(msg)) {
-        const stmtRes = await chrome.debugger.sendCommand({tabId},'Runtime.evaluate',
-          {expression:`(async function(){${text}})()`,returnByValue:true,awaitPromise:true});
-        if (stmtRes.exceptionDetails) throw new Error(stmtRes.exceptionDetails.exception?.description||'JS error');
-        return ok([{type:'text',text:formatJsResult(stmtRes.result?.value)}]);
-      }
-      throw new Error(msg);
-    }
-    return ok([{type:'text',text:formatJsResult(cdpRes.result?.value)}]);
-  }
-}
-
-function formatJsResult(v) {
-  if (v === undefined || v === null) return String(v);
-  if (typeof v === 'string') return v;
-  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
-  try { return JSON.stringify(v, null, 2); } catch { return String(v); }
-}
-
-async function toolGetPageText(args) {
-  const tabId = args.tabId; if (!tabId) return err('tabId required');
-  await ensureCs(tabId);
-  const maxChars = args.max_chars||50000;
-  const [r] = await chrome.scripting.executeScript({
-    target:{tabId},
-    func:max=>{const b=globalThis.__pageBridge; return b?b.getPageText(max):{error:'Page bridge not available'};},
-    args:[maxChars],
-  });
-  const res = r?.result;
-  if (!res||res.error) return err(res?.error||'Failed to get page text');
-  if (!res.content) return ok([{type:'text',text:'(no text content)'}]);
-  return ok([{type:'text',text:`Title: ${res.title||'N/A'}\nURL: ${res.url||'N/A'}\n\n${res.content}`}]);
-}
-async function toolFileUpload(args) {
-  const {tabId, paths, ref, triggerRef} = args;
-  if (!tabId) return err('tabId required');
-  if (!paths?.length) return err('paths required');
-  for (const r of [ref, triggerRef]) {
-    if (r && parseRef(r)?.frameId) return err(`file_upload does not support elements inside iframes yet (${r}). Use a ref from the main frame.`);
-  }
-  await ensureCdp(tabId);
-
-  if (ref) {
-    // Direct file input via ref
-    await ensureCs(tabId);
-    const root = (await chrome.debugger.sendCommand({tabId},'DOM.getDocument')).root.nodeId;
-    // Mark element with token to find it via CDP
-    const token = `bmcp-${Date.now()}`;
-    await chrome.scripting.executeScript({
-      target:{tabId},
-      func:(r,t,attr)=>{const el=globalThis.__accessibilityTree?.getElementByRef(r); if(el)el.setAttribute(attr,t);},
-      args:[ref, token, 'data-bmcp-token'],
-    });
-    const {nodeId} = await chrome.debugger.sendCommand({tabId},'DOM.querySelector',
-      {nodeId:root, selector:`input[type="file"][data-bmcp-token="${token}"]`});
-    if (!nodeId) return err('Could not locate file input in DOM');
-    await chrome.debugger.sendCommand({tabId},'DOM.setFileInputFiles',{files:paths,nodeId});
-    // cleanup token
-    await chrome.scripting.executeScript({target:{tabId},
-      func:attr=>document.querySelector(`[${attr}]`)?.removeAttribute(attr),args:['data-bmcp-token']}).catch(()=>{});
-    return ok([{type:'text',text:`File(s) set on input ${ref}: ${paths.join(', ')}`}]);
-  }
-
-  if (triggerRef) {
-    // Intercept file chooser
-    await chrome.debugger.sendCommand({tabId},'Page.setInterceptFileChooserDialog',{enabled:true});
-    try {
-      // Click trigger
-      await ensureCs(tabId);
-      const [cr] = await chrome.scripting.executeScript({
-        target:{tabId},
-        func:r=>{const el=globalThis.__accessibilityTree?.getElementCoordinates(r,{scrollIntoView:true}); return el||null;},
-        args:[triggerRef],
-      });
-      if (!cr?.result) return err(`Trigger element not found: ${triggerRef}`);
-      const {x,y} = cr.result;
-      await chrome.debugger.sendCommand({tabId},'Input.dispatchMouseEvent',{type:'mouseMoved',x,y});
-      await sleep(50);
-      await chrome.debugger.sendCommand({tabId},'Input.dispatchMouseEvent',{type:'mousePressed',x,y,button:'left',clickCount:1});
-      await sleep(50);
-      await chrome.debugger.sendCommand({tabId},'Input.dispatchMouseEvent',{type:'mouseReleased',x,y,button:'left',clickCount:1});
-
-      // Wait for chooser event
-      const chooser = await new Promise((resolve,reject)=>{
-        const tid = setTimeout(()=>{chrome.debugger.onEvent.removeListener(h);reject(new Error('File chooser timeout'));},5000);
-        function h(src,method,params){
-          if(src.tabId===tabId && method==='Page.fileChooserOpened'){
-            clearTimeout(tid); chrome.debugger.onEvent.removeListener(h); resolve(params);
-          }
-        }
-        chrome.debugger.onEvent.addListener(h);
-      });
-      if (!chooser.backendNodeId) return err('File chooser opened without target input');
-      await chrome.debugger.sendCommand({tabId},'DOM.setFileInputFiles',{files:paths,backendNodeId:chooser.backendNodeId});
-      return ok([{type:'text',text:`File(s) uploaded via ${triggerRef}: ${paths.join(', ')}`}]);
-    } finally {
-      await chrome.debugger.sendCommand({tabId},'Page.setInterceptFileChooserDialog',{enabled:false}).catch(()=>{});
-    }
-  }
-
-  return err('Provide ref (input[type=file]) or triggerRef (upload button)');
-}
-
 async function toolResizeWindow(args) {
   const {tabId, width=1280, height=720} = args;
   const w = Math.max(400,Math.min(7680,width)), h = Math.max(300,Math.min(4320,height));
@@ -1191,6 +1057,10 @@ async function toolPerformance(args) {
 }
 
 const toolEmulate = createEmulateTool({ chrome, ok, err, ensureCdp, emulatedTabs, networkPresets: NETWORK_PRESETS });
+
+const { toolJavascript, toolGetPageText, toolFileUpload } = createPageTools({
+  chrome, ok, err, ensureCdp, ensureCs, runInRefFrame, getElemCoords, sleep,
+});
 
 const TOOL_MAP = {
   performance: toolPerformance, emulate: toolEmulate,

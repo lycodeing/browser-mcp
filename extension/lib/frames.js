@@ -1,7 +1,6 @@
 // 多 frame 页面的纯逻辑：ref 解析与加前缀、树合并、find 结果合并、坐标偏移。
 // 主 frame 的 ref 保持 ref_N，子 frame 为 f<frameId>.ref_N（每个 frame 的计数器各自从 1 开始）。
 
-const MAX_MERGED_FRAMES = 30;
 const REF_AT_LINE_START = /^(\s*)\[(ref_\d+)\]/gm;
 
 export function parseRef(input) {
@@ -135,3 +134,5 @@ export function resolveFrameOffset(frameId, infos) {
 export function toTopPoint(offset, point) {
   return [offset.x + offset.scale * point[0], offset.y + offset.scale * point[1]];
 }
+
+export const MAX_MERGED_FRAMES = 30;

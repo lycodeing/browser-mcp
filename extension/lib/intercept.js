@@ -50,9 +50,17 @@ export function wildcardMatch(tokens, text) {
 // ── 校验 ──────────────────────────────────────────────────────────────────────
 const utf8Length = (s) => new TextEncoder().encode(s).length;
 
+// 合法 base64（标准字母表、无空白、长度补齐）时返回解码字节数，否则 -1
+export function base64ByteLength(s) {
+  if (typeof s !== 'string' || s.length === 0 || s.length % 4 !== 0) return -1;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(s)) return -1;
+  const padding = s.endsWith('==') ? 2 : s.endsWith('=') ? 1 : 0;
+  return s.length / 4 * 3 - padding;
+}
+
 /** 返回 { error } 或 { spec }。spec 是补好默认值、可直接入库的规则（不含 id 与 hits） */
 export function validateRule(args) {
-  const { urlPattern, action, method, errorReason, status, headers, body, delayMs } = args;
+  const { urlPattern, action, method, errorReason, status, headers, body, bodyBase64, delayMs } = args;
   if (typeof urlPattern !== 'string' || urlPattern === '') return { error: 'urlPattern required' };
   if (urlPattern.length > MAX_PATTERN_LENGTH) return { error: `urlPattern too long (max ${MAX_PATTERN_LENGTH} chars)` };
   if (!ACTIONS.includes(action)) return { error: `Unknown action: ${action}. Use fail, fulfill or delay` };
@@ -84,10 +92,21 @@ export function validateRule(args) {
       }
       spec.headers = clean;
     }
-    const text = body ?? '';
-    if (typeof text !== 'string') return { error: 'body must be a string' };
-    if (utf8Length(text) > MAX_BODY_BYTES) return { error: `body too large (max ${MAX_BODY_BYTES / 1024 / 1024} MB)` };
-    spec.body = text;
+    if (body !== undefined && bodyBase64 !== undefined) {
+      return { error: 'Provide either body (text) or bodyBase64 (binary), not both' };
+    }
+    if (bodyBase64 !== undefined) {
+      const bytes = base64ByteLength(bodyBase64);
+      if (bytes < 0) return { error: 'Invalid base64 in bodyBase64 (standard alphabet, no line breaks, length must be a multiple of 4)' };
+      if (bytes > MAX_BODY_BYTES) return { error: `bodyBase64 too large (decoded ${bytes} B, max ${MAX_BODY_BYTES / 1024 / 1024} MB)` };
+      spec.bodyB64 = bodyBase64;
+      spec.bodyBytes = bytes;
+    } else {
+      const text = body ?? '';
+      if (typeof text !== 'string') return { error: 'body must be a string' };
+      if (utf8Length(text) > MAX_BODY_BYTES) return { error: `body too large (max ${MAX_BODY_BYTES / 1024 / 1024} MB)` };
+      spec.body = text;
+    }
   } else {
     if (!Number.isInteger(delayMs) || delayMs < 1 || delayMs > MAX_DELAY_MS) {
       return { error: `delay needs delayMs, an integer from 1 to ${MAX_DELAY_MS}` };
@@ -183,7 +202,10 @@ export function createInterceptStore() {
         if (!Number.isInteger(tabId) || !t || !Array.isArray(t.rules)) continue;
         const entries = [];
         for (const r of t.rules) {
-          const { spec } = validateRule(r ?? {});
+          // 入库后的字段名是 bodyB64（validateRule 的入参名是 bodyBase64），load 时改名；
+          // 坏 base64 让 validateRule 失败，该条目整体跳过（与旧语义一致）
+          const { bodyB64, ...rest } = r ?? {};
+          const { spec } = validateRule(bodyB64 !== undefined ? { ...rest, bodyBase64: bodyB64 } : rest);
           if (!spec || typeof r.id !== 'string') continue;
           const rule = { id: r.id, ...spec, hits: Number.isInteger(r.hits) ? r.hits : 0 };
           entries.push({ rule, tokens: compilePattern(rule.urlPattern) });
@@ -223,27 +245,32 @@ export function isPreflight(request) {
     && headerValue(request.headers, 'access-control-request-method') !== undefined;
 }
 
-/** fulfill 规则的响应参数。没有 content-type 时补 text/plain；跨域请求缺 allow-origin 时回显 Origin */
+/** fulfill 规则的响应参数。没有 content-type 时补 text/plain（二进制 body 不补）；
+ * 跨域请求回显 Origin 并补 allow-credentials: true（规范禁止 * 与 credentials 同用）。规则自己写的不覆盖。 */
 export function buildFulfillment(rule, request) {
   const responseHeaders = Object.entries(rule.headers ?? {}).map(([name, value]) => ({ name, value }));
   const has = (n) => responseHeaders.some((h) => h.name.toLowerCase() === n);
-  if (!has('content-type')) responseHeaders.push({ name: 'content-type', value: 'text/plain; charset=utf-8' });
+  const binary = rule.bodyB64 !== undefined;
+  if (!binary && !has('content-type')) responseHeaders.push({ name: 'content-type', value: 'text/plain; charset=utf-8' });
   const origin = headerValue(request.headers, 'origin');
-  if (origin !== undefined && !has('access-control-allow-origin')) {
-    responseHeaders.push({ name: 'access-control-allow-origin', value: origin });
+  if (origin !== undefined) {
+    if (!has('access-control-allow-origin')) responseHeaders.push({ name: 'access-control-allow-origin', value: origin });
+    if (!has('access-control-allow-credentials')) responseHeaders.push({ name: 'access-control-allow-credentials', value: 'true' });
   }
   const out = { responseCode: rule.status, responseHeaders };
-  if (rule.body) out.body = utf8ToBase64(rule.body);
+  const bodyB64 = binary ? rule.bodyB64 : rule.body ? utf8ToBase64(rule.body) : undefined;
+  if (bodyB64) out.body = bodyB64;
   return out;
 }
 
-/** 预检请求的自动应答：204，回显来源、方法与请求头 */
+/** 预检请求的自动应答：204，回显来源、方法与请求头，带 Origin 时补 allow-credentials */
 export function buildPreflightResponse(request) {
   const origin = headerValue(request.headers, 'origin');
   const headers = [
     { name: 'access-control-allow-origin', value: origin ?? '*' },
     { name: 'access-control-allow-methods', value: headerValue(request.headers, 'access-control-request-method') },
   ];
+  if (origin !== undefined) headers.push({ name: 'access-control-allow-credentials', value: 'true' });
   const asked = headerValue(request.headers, 'access-control-request-headers');
   if (asked) headers.push({ name: 'access-control-allow-headers', value: asked });
   return { responseCode: 204, responseHeaders: headers };
@@ -287,7 +314,10 @@ export function formatRule(rule) {
   let what;
   if (rule.action === 'fail') what = `fail ${rule.errorReason}`;
   else if (rule.action === 'delay') what = `delay ${rule.delayMs}ms`;
-  else {
+  else if (rule.bodyB64 !== undefined) {
+    const n = Object.keys(rule.headers ?? {}).length;
+    what = `fulfill ${rule.status}, ${n} header${n === 1 ? '' : 's'}, body ${rule.bodyBytes} B (binary)`;
+  } else {
     const n = Object.keys(rule.headers ?? {}).length;
     what = `fulfill ${rule.status}, ${n} header${n === 1 ? '' : 's'}, body ${utf8Length(rule.body ?? '')} B`;
   }
