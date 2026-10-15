@@ -259,3 +259,59 @@ test('storage 的 maxChars 超出范围被拒绝', async () => {
   });
   assert.equal(res.isError, true);
 });
+
+// ── C 批：frameId / allFrames / bodyBase64 ────────────────────────────────────
+
+test('get_page_text 的 frameId 与 allFrames 字段存在且字符串数字可还原', async () => {
+  setExtensionWs(fakeWs);
+  received.length = 0;
+  const client = await connectClient();
+  await client.callTool({
+    name: 'get_page_text',
+    arguments: { tabId: '5', frameId: '3' },
+  });
+  assert.equal(received[0].tool, 'get_page_text');
+  assert.equal(received[0].arguments.frameId, 3);
+
+  received.length = 0;
+  await client.callTool({
+    name: 'get_page_text',
+    arguments: { tabId: 5, allFrames: 'true' },
+  });
+  assert.equal(received[0].arguments.allFrames, true);
+});
+
+test('javascript_tool 的 frameId 字段存在且字符串数字可还原', async () => {
+  setExtensionWs(fakeWs);
+  received.length = 0;
+  const client = await connectClient();
+  await client.callTool({
+    name: 'javascript_tool',
+    arguments: { tabId: '5', frameId: '9', text: 'location.href' },
+  });
+  assert.equal(received[0].tool, 'javascript_tool');
+  assert.equal(received[0].arguments.frameId, 9);
+  assert.equal(received[0].arguments.text, 'location.href');
+});
+
+test('get_page_text 拒绝非数字 frameId（isError 回复）', async () => {
+  setExtensionWs(fakeWs);
+  const client = await connectClient();
+  const res = await client.callTool({
+    name: 'get_page_text', arguments: { tabId: 5, frameId: 'abc' },
+  });
+  assert.equal(res.isError, true);
+});
+
+test('intercept_add 的 bodyBase64 透传给扩展', async () => {
+  setExtensionWs(fakeWs);
+  received.length = 0;
+  const client = await connectClient();
+  const b64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ';
+  await client.callTool({
+    name: 'intercept_add',
+    arguments: { tabId: 7, urlPattern: '*/i.png', action: 'fulfill', headers: { 'content-type': 'image/png' }, bodyBase64: b64 },
+  });
+  assert.equal(received[0].tool, 'intercept_add');
+  assert.equal(received[0].arguments.bodyBase64, b64);
+});

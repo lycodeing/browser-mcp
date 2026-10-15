@@ -77,17 +77,20 @@ const SCHEMAS = {
   },
   javascript_tool: {
     tabId: num(),
+    frameId: num(z.number().int().min(0)).optional().describe('Frame to run the code in: 0 = main frame (default), f<id> from read_page output for iframes'),
     text: z.string().min(1).describe('JS code to run (no return statement needed)'),
   },
   get_page_text: {
     tabId: num(),
+    frameId: num(z.number().int().min(0)).optional().describe('Extract text from this frame only: 0 = main frame (default), f<id> for iframes'),
+    allFrames: bool().optional().describe('Merge text from every frame, each section headed by its frame'),
     max_chars: num(z.number().min(1000).max(200000)).optional().default(50000),
   },
   file_upload: {
     tabId: num(),
     paths: z.array(z.string()).min(1).describe('Absolute file paths to upload'),
-    ref: z.string().optional().describe('Ref of input[type=file] element'),
-    triggerRef: z.string().optional().describe('Ref of button that opens file picker'),
+    ref: z.string().optional().describe('Ref of input[type=file] element; iframes refs like f3.ref_7 work'),
+    triggerRef: z.string().optional().describe('Ref of button that opens file picker; iframes refs work too'),
   },
   resize_window: {
     tabId: num(),
@@ -219,6 +222,7 @@ const SCHEMAS = {
     status: num(z.number().int().min(100).max(599)).optional().describe('fulfill: HTTP status, default 200'),
     headers: z.record(z.string()).optional().describe('fulfill: response headers'),
     body: z.string().optional().describe('fulfill: text response body, up to 1 MB'),
+    bodyBase64: z.string().optional().describe('fulfill: binary response body as base64 (e.g. a PNG), up to 1 MB decoded; mutually exclusive with body'),
     delayMs: num(z.number().int().min(1).max(60000)).optional().describe('delay: milliseconds to hold each matching request (required for delay)'),
   },
   intercept_list: {
@@ -238,9 +242,9 @@ const DESCRIPTIONS = {
   find: 'Find page elements by keyword. Use exact visible text (e.g. "Submit", "Add to cart").',
   form_input: 'Set a value on a form field (input, select, textarea, contenteditable) by ref.',
   navigate: 'Navigate to a URL, or go "back" / "forward" in history.',
-  javascript_tool: 'Execute JavaScript in the page context. Return value of the last expression is returned.',
-  get_page_text: 'Extract plain text content from the page, prioritising article content.',
-  file_upload: 'Upload local files to a page file input. Use ref for visible input[type=file], triggerRef for a button that opens the picker.',
+  javascript_tool: 'Execute JavaScript in the page context. Optional frameId targets an iframe (0 = main frame, default); document/location/window then belong to that frame. Return value of the last expression is returned.',
+  get_page_text: 'Extract plain text content from the page, prioritising article content. Default: main frame only. frameId extracts one iframe\'s text; allFrames:true merges every frame, each section headed by its frame and capped by max_chars overall.',
+  file_upload: 'Upload local files to a page file input. Use ref for visible input[type=file], triggerRef for a button that opens the picker. Iframe refs (e.g. f3.ref_7) work for both.',
   resize_window: 'Resize the browser window.',
   read_console_messages: 'Read buffered browser console messages from a tab.',
   network: 'Inspect HTTP network requests observed in a tab. Requests are only captured after the first network call on that tab attaches the debugger: requests made before that first call have no data. action "list" shows captured requests with their number (#N), method, status or failure reason, and URL; use urlPattern/method/status/failedOnly filters and clear to reset the buffer. action "detail" returns the request/response headers and bodies of one request chosen by seq (the #N from list); the response body is NOT included inline by default beyond bodyLimit characters and can be written to disk with saveTo (absolute path) instead of entering the context; authorization/cookie header values are masked unless rawHeaders:true. Binary bodies report size and MIME type only.',
@@ -252,7 +256,7 @@ const DESCRIPTIONS = {
   downloads: 'List downloads, wait for a download to complete and get its local path, or erase history entries.',
   performance: 'Inspect page performance. "metrics" returns an instant snapshot (LCP, CLS, INP, FCP, TTFB, JS heap, DOM nodes, listeners, slowest resources). "trace_start" then "trace_stop" records a Chrome trace and returns a summary (long tasks, blocking time, main-thread breakdown, heaviest scripts); use reload:true on trace_start to capture page load. Combine with emulate to test under throttling.',
   emulate: 'Emulate a device and environment on a tab (CDP): device presets (iphone-15, ipad-air, pixel-8) or custom width/height/deviceScaleFactor/mobile, geolocation, timezone, locale, CPU/network throttling, color scheme, user agent. Overrides stay until reset:true or the debugger detaches. Geolocation only reaches the page if the site already has location permission in Chrome; this tool cannot grant it.',
-  intercept_add: 'Intercept and mock network requests on a tab (CDP Fetch). Add a rule that matches requests by URL wildcard (and optionally method): fail aborts them with a network error, fulfill answers with a mock status/headers/body, delay holds them for delayMs. The first matching rule wins. Cross-origin mocks get access-control-allow-origin added and CORS preflights are answered automatically; credentialed cross-origin requests are not handled. Rules last until intercept_remove, the tab closes, or the debugger detaches (DevTools opened); they survive extension restarts. Mocked requests still show up in network list as normal responses.',
+  intercept_add: 'Intercept and mock network requests on a tab (CDP Fetch). Add a rule that matches requests by URL wildcard (and optionally method): fail aborts them with a network error, fulfill answers with a mock status/headers/body (text via body, binary via bodyBase64, up to 1 MB), delay holds them for delayMs. The first matching rule wins. Cross-origin mocks get access-control-allow-origin echoed and access-control-allow-credentials added, and CORS preflights are answered automatically. Rules last until intercept_remove, the tab closes, or the debugger detaches (DevTools opened); they survive extension restarts. Mocked requests still show up in network list as normal responses.',
   intercept_list: 'List the intercept rules on a tab with their hit counts and whether interception is currently active.',
   intercept_remove: 'Remove one intercept rule by id, or all rules on the tab (omit ruleId), which also turns interception off.',
   storage: 'Read and write localStorage / sessionStorage of the tab\'s main frame, or summarize IndexedDB. Actions: list (keys with size and a short preview), get (one value, truncated at maxChars), set / remove / clear (writes), idb (read-only summary of databases, object stores and record counts; record contents are never read). Works on the top-level frame\'s origin only, not on iframes; the first line of every result shows the origin. Values are not masked, treat them like cookies.',
@@ -294,7 +298,7 @@ export const TOOL_TIMEOUTS = Object.fromEntries(
 export function buildMcpServer() {
   const server = new McpServer({
     name: 'browser-mcp',
-    version: '2.1.0',
+    version: '2.2.0',
   });
 
   for (const [name, schema] of Object.entries(SCHEMAS)) {
@@ -468,7 +472,7 @@ export function startMcpServer(port = 3000) {
     const info = getExtensionInfo();
     res.json({
       service: 'browser-mcp-relay',
-      version: '2.1.0',
+      version: '2.2.0',
       extension: info,
     });
   });
