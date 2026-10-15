@@ -11,7 +11,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { invokeTool, isConnected, getExtensionInfo } from './bridge.js';
-import { lenientNumber as num, lenientBoolean as bool, lenientNumberTuple } from './schema-helpers.js';
+import {
+  lenientNumber as num, lenientBoolean as bool, lenientNumberTuple, lenientNumberArray,
+} from './schema-helpers.js';
 
 // ─── Tool schema helpers ────────────────────────────────────────────────────
 // 所有 schema 在模块加载时创建一次，避免每请求重建
@@ -99,16 +101,33 @@ const SCHEMAS = {
     clear: bool().optional().default(false),
     limit: num(z.number().min(1).max(1000)).optional().default(100),
   },
-  read_network_requests: {
-    tabId: num(),
-    urlPattern: z.string().optional().describe('Filter by URL substring'),
-    clear: bool().optional().default(false),
-    limit: num(z.number().min(1).max(1000)).optional().default(100),
+  network: {
+    action: z.enum(['list', 'detail']).describe('What to do with observed network requests'),
+    tabId: num().describe('Target tab ID'),
+    urlPattern: z.string().optional().describe('list: filter by URL substring'),
+    method: z.string().optional().describe('list: HTTP method filter, case-insensitive'),
+    status: z.string().optional().describe('list: "404", "4xx" or "500-599"'),
+    failedOnly: bool().optional().default(false)
+      .describe('list: network failures and HTTP status >= 400'),
+    limit: num(z.number().min(1).max(1000)).optional().default(100).describe('list: max entries to return'),
+    clear: bool().optional().default(false).describe('list: clear the buffer after reading (seq is not reset)'),
+    seq: num(z.number().int().min(1)).optional().describe('detail: request number (#N) shown by list'),
+    bodyLimit: num(z.number().int().min(500).max(200000)).optional().default(20000)
+      .describe('detail: max response body characters returned inline'),
+    rawHeaders: bool().optional().default(false)
+      .describe('detail: show authorization/cookie header values as-is instead of masked'),
+    saveTo: z.string().optional().describe('detail: absolute local path to save the full response body'),
   },
-  tabs_context: {},
-  tabs_create: {},
-  tabs_close: {
-    tabId: num().describe('Tab ID to close'),
+  tabs: {
+    action: z.enum(['list', 'create', 'close', 'activate', 'reload', 'duplicate', 'group'])
+      .describe('Tab operation'),
+    tabId: num().optional().describe('activate/reload/duplicate: target tab'),
+    tabIds: lenientNumberArray().optional().describe('close/group: target tabs'),
+    url: z.string().optional().describe('create: URL to open, omitted opens about:blank'),
+    active: bool().optional().describe('create: focus the new tab, default true'),
+    group: z.string().min(1).max(40).optional()
+      .describe('list: filter by group name. create/group: group name, found or created in the tab\'s window. group without a name removes the tabs from their group'),
+    bypassCache: bool().optional().describe('reload: skip the cache'),
   },
   wait_for: {
     tabId: num().describe('Target tab ID'),
@@ -173,7 +192,7 @@ const SCHEMAS = {
 // ─── Tool descriptions ────────────────────────────────────────────────────────
 
 const DESCRIPTIONS = {
-  computer: 'Control the browser with mouse, keyboard, and screenshots. Use tabs_context first if you need a valid tabId. Screenshots are costly in tokens: prefer read_page/find with ref for locating and clicking, and use screenshot (or zoom on a region for detail) only when visual confirmation is needed.',
+  computer: 'Control the browser with mouse, keyboard, and screenshots. Use tabs (action list) first if you need a valid tabId. Screenshots are costly in tokens: prefer read_page/find with ref for locating and clicking, and use screenshot (or zoom on a region for detail) only when visual confirmation is needed.',
   read_page: 'Get accessibility tree of the page. Use filter="interactive" for inputs/buttons only.',
   find: 'Find page elements by keyword. Use exact visible text (e.g. "Submit", "Add to cart").',
   form_input: 'Set a value on a form field (input, select, textarea, contenteditable) by ref.',
@@ -183,10 +202,8 @@ const DESCRIPTIONS = {
   file_upload: 'Upload local files to a page file input. Use ref for visible input[type=file], triggerRef for a button that opens the picker.',
   resize_window: 'Resize the browser window.',
   read_console_messages: 'Read buffered browser console messages from a tab.',
-  read_network_requests: 'Read buffered HTTP network requests from a tab.',
-  tabs_context: 'List all open non-system tabs with their IDs, titles, and URLs.',
-  tabs_create: 'Create a new blank tab and return its ID.',
-  tabs_close: 'Close a tab by its ID.',
+  network: 'Inspect HTTP network requests observed in a tab. Requests are only captured after the first network call on that tab attaches the debugger: requests made before that first call have no data. action "list" shows captured requests with their number (#N), method, status or failure reason, and URL; use urlPattern/method/status/failedOnly filters and clear to reset the buffer. action "detail" returns the request/response headers and bodies of one request chosen by seq (the #N from list); the response body is NOT included inline by default beyond bodyLimit characters and can be written to disk with saveTo (absolute path) instead of entering the context; authorization/cookie header values are masked unless rawHeaders:true. Binary bodies report size and MIME type only.',
+  tabs: 'Manage browser tabs and named tab groups. Actions: list (shows tab id, title, URL, window, group, and the active tab; optional group name filter), create (optional url; loads before returning; optional group name; active defaults to true — background tabs (active:false) get throttled by the browser, so keep active:true for pages where you need screenshots or animations), close (tabIds, batch), activate (tabId, also focuses its window), reload (tabId, optional bypassCache), duplicate (tabId), group (tabIds; group name is looked up or created in the window of the tabs; same-named groups in different windows are separate groups; omitting group ungroups the tabs). Group names are trimmed, 1-40 chars. Use tabs (action list) to discover tabIds.',
   wait_for: 'Wait for an element to appear/disappear, URL change, network idle, or a fixed time. Prefer over blind sleeps after navigation.',
   handle_dialog: 'Answer a pending JS dialog (alert/confirm/prompt) left open by dialog:"manual".',
   save_pdf: 'Save the page as PDF to a local file via CDP printToPDF.',
@@ -197,24 +214,41 @@ const DESCRIPTIONS = {
 };
 
 // ─── Per-tool timeout (ms) ────────────────────────────────────────────────────
-// 轻量操作快速失败，避免卡住整个会话
+// 轻量操作快速失败，避免卡住整个会话。
+// relay 的超时从发出请求起算，包含扩展侧串行队列的排队时间：
+// 排队上限 QUEUE_WAIT_MS（写操作按 tabId 先进先出，超过即返回"标签页忙"）。
+// 若不把排队窗口加进超时，排队还没轮到 relay 就先报笼统的 timed out。
 
-const TOOL_TIMEOUTS = {
-  tabs_context: 5000, tabs_create: 5000, tabs_close: 5000,
-  find: 15000, read_page: 15000, form_input: 15000, get_page_text: 15000,
-  resize_window: 10000, read_console_messages: 10000, read_network_requests: 10000,
-  navigate: 30000, computer: 30000, javascript_tool: 30000, file_upload: 30000,
+/** 排队等待上限；排队工具的 relay 超时 = 基础值 + QUEUE_WAIT_MS */
+const QUEUE_WAIT_MS = 30000;
+
+/** 基础超时（不含排队等待），工具自身的执行时间预算 */
+const BASE_TIMEOUTS = {
+  computer: 30000, form_input: 15000, navigate: 30000,
+  file_upload: 30000, javascript_tool: 30000,
+  tabs: 40000, // 含 create 的页面加载等待
+  network: 15000,
+  find: 15000, read_page: 15000, get_page_text: 15000,
+  resize_window: 10000, read_console_messages: 10000,
   wait_for: 130000, handle_dialog: 5000, save_pdf: 60000,
   cookies: 10000, downloads: 610000,
   performance: 60000, emulate: 10000,
 };
+
+/** 会进扩展侧串行队列的工具；其超时叠加排队等待，避免排队期间被 relay 判超时 */
+const QUEUED_TOOLS = new Set(['computer', 'form_input', 'navigate', 'file_upload', 'javascript_tool', 'tabs']);
+
+/** 最终生效的超时表 = 基础表 + 排队工具的 QUEUE_WAIT_MS */
+export const TOOL_TIMEOUTS = Object.fromEntries(
+  Object.entries(BASE_TIMEOUTS).map(([name, ms]) => [name, QUEUED_TOOLS.has(name) ? ms + QUEUE_WAIT_MS : ms]),
+);
 
 // ─── Build a fresh McpServer with all tools registered ──────────────────────────
 
 export function buildMcpServer() {
   const server = new McpServer({
     name: 'browser-mcp',
-    version: '1.1.0',
+    version: '2.0.0',
   });
 
   for (const [name, schema] of Object.entries(SCHEMAS)) {
@@ -237,6 +271,42 @@ async function saveBase64(saveTo, base64) {
 function formatSize(n) {
   return n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB`
     : n >= 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} B`;
+}
+
+// x-file：扩展与 relay 之间的私有内容项（如 network detail 的完整响应体），
+// 仅用于落盘通道，绝不能以原样到达 MCP 客户端。
+const X_FILE_TYPE = 'x-file';
+
+/**
+ * x-file 落盘：请求带 saveTo 时写入磁盘并替换为路径文本。
+ * 不带 saveTo 的 x-file 不算错误（调用方本就没要文件），由 stripXFile 统一剔除。
+ * 返回 { result, error }；error 非空时调用方应整包转成 isError 回复。
+ */
+async function applyXFile(args, result) {
+  const saveTo = args?.saveTo;
+  let error = null;
+
+  for (let i = 0; i < result.content.length; i++) {
+    if (result.content[i].type !== X_FILE_TYPE) continue;
+    const base64 = result.content[i].data;
+    // 不带 saveTo 的请求本就没要文件，静默剔除即可，不算失败
+    if (!saveTo) {
+      result.content.splice(i, 1);
+      i--;
+      continue;
+    }
+    try {
+      const size = await saveBase64(saveTo, base64);
+      result.content[i] = { type: 'text', text: `Saved to ${saveTo} (${formatSize(size)})` };
+    } catch (e) {
+      error = error ?? `Error: failed to save to ${saveTo}: ${e.message}`;
+      // 写盘失败也要移除该项，避免 base64 泄漏进上下文
+      result.content.splice(i, 1);
+      i--;
+    }
+  }
+
+  return { result, error };
 }
 
 async function applySaveTo(args, result) {
@@ -293,6 +363,15 @@ async function spillLargeImages(result) {
   return result;
 }
 
+// ─── 出站内容清洗 ─────────────────────────────────────────────────────────────
+
+/** 丢弃所有残留的 x-file 项：不带 saveTo 或写盘失败的兜底，保证非标准类型不泄漏给客户端 */
+function stripXFile(result) {
+  if (!result?.content) return result;
+  result.content = result.content.filter((c) => c.type !== X_FILE_TYPE);
+  return result;
+}
+
 // ─── Relay helper: call bridge and format MCP response ──────────────────────
 
 async function relay(tool, args) {
@@ -309,7 +388,17 @@ async function relay(tool, args) {
   try {
     const result = await invokeTool(tool, args, TOOL_TIMEOUTS[tool] || 60000);
     // Extension already returns MCP-formatted content
-    if (result && result.content) return await spillLargeImages(await applySaveTo(args, result));
+    if (result && result.content) {
+      let out = await spillLargeImages(await applySaveTo(args, result));
+      const xfile = await applyXFile(args, out);
+      if (xfile.error) {
+        return {
+          content: [...stripXFile(xfile.result).content, { type: 'text', text: xfile.error }],
+          isError: true,
+        };
+      }
+      return stripXFile(out);
+    }
     return { content: [{ type: 'text', text: JSON.stringify(result) }] };
   } catch (err) {
     return {
@@ -333,7 +422,7 @@ export function startMcpServer(port = 3000) {
     const info = getExtensionInfo();
     res.json({
       service: 'browser-mcp-relay',
-      version: '1.1.0',
+      version: '2.0.0',
       extension: info,
     });
   });
