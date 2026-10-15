@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>browser-mcp B 批：状态与模拟 · 功能介绍与示意图</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --ink: #1c2230; --muted: #667085; --line: #e3e6ec;
+    --brand: #4f46e5; --brand-soft: #eef0ff;
+    --green: #16a34a; --green-soft: #e8f7ee;
+    --red: #dc2626; --red-soft: #fdeceb;
+    --amber: #b45309; --amber-soft: #fdf3e1;
+    --blue: #2563eb; --orange: #ea580c; --pink: #db2777;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.7 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { background: #1c2230; color: #fff; padding: 40px 24px 32px; }
+  header .wrap, main { max-width: 1040px; margin: 0 auto; }
+  header h1 { margin: 0 0 8px; font-size: 26px; }
+  header p { margin: 0; color: #b8c0d4; }
+  .badge { display: inline-block; padding: 1px 10px; border-radius: 999px; font-size: 12px;
+    background: #ffffff22; color: #dfe4f3; margin-bottom: 12px; }
+  nav { position: sticky; top: 0; z-index: 5; background: #fffd; backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line); }
+  nav .wrap { max-width: 1040px; margin: 0 auto; padding: 8px 24px; display: flex; gap: 18px; flex-wrap: wrap; }
+  nav a { color: var(--muted); text-decoration: none; font-size: 13px; }
+  nav a:hover { color: var(--brand); }
+  main { padding: 28px 24px 80px; }
+  section { margin-bottom: 36px; }
+  h2 { font-size: 20px; margin: 0 0 4px; }
+  h2 .no { color: var(--brand); margin-right: 8px; }
+  .lead { color: var(--muted); margin: 0 0 16px; }
+  h3 { font-size: 15px; margin: 20px 0 8px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; }
+  .grid { display: grid; gap: 14px; }
+  .g4 { grid-template-columns: repeat(4, 1fr); }
+  .g3 { grid-template-columns: repeat(3, 1fr); }
+  .g2 { grid-template-columns: repeat(2, 1fr); }
+  @media (max-width: 760px) { .g4, .g3, .g2 { grid-template-columns: 1fr; } }
+  .stat .n { font-size: 30px; font-weight: 700; color: var(--brand); line-height: 1.2; }
+  .stat .t { color: var(--muted); font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; background: #fafbfc; }
+  code, pre { font-family: var(--mono); font-size: 12.5px; }
+  code { background: #eef0f4; padding: 1px 6px; border-radius: 4px; }
+  pre { margin: 0; background: #151a26; color: #d6dcec; padding: 14px 16px; border-radius: 10px;
+    overflow-x: auto; line-height: 1.6; }
+  pre .c { color: #7d879f; } pre .k { color: #8fb4ff; } pre .ok { color: #6ee7a0; }
+  pre .bad { color: #ff8a80; } pre .warn { color: #ffd07a; }
+  .tag { display: inline-block; font-size: 12px; padding: 0 8px; border-radius: 6px; font-weight: 600; }
+  .t-del { background: var(--red-soft); color: var(--red); }
+  .t-new { background: var(--green-soft); color: var(--green); }
+  .t-up { background: var(--brand-soft); color: var(--brand); }
+  .note { border-left: 3px solid var(--amber); background: var(--amber-soft); color: #7a4a0c;
+    padding: 10px 14px; border-radius: 0 8px 8px 0; margin-top: 14px; font-size: 14px; }
+  .cap { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+  ul { margin: 6px 0; padding-left: 20px; }
+
+  /* 拦截流程图 */
+  .flow { display: flex; align-items: stretch; gap: 8px; flex-wrap: wrap; }
+  .step { flex: 1; min-width: 140px; background: #fff; border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 12px; font-size: 13px; }
+  .step b { display: block; font-size: 12px; color: var(--brand); margin-bottom: 2px; }
+  .arrow { align-self: center; color: var(--muted); font-size: 18px; }
+  .branch { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 10px; }
+  @media (max-width: 760px) { .branch { grid-template-columns: 1fr 1fr; } }
+  .br { border-radius: 10px; padding: 10px 12px; font-size: 13px; border: 1px solid var(--line); background: #fff; }
+  .br b { display: block; font-size: 12px; margin-bottom: 2px; }
+  .br.fail b { color: var(--red); } .br.ful b { color: var(--green); }
+  .br.dly b { color: var(--orange); } .br.pass b { color: var(--muted); }
+
+  /* 设备示意 */
+  .devs { display: flex; gap: 22px; align-items: flex-end; flex-wrap: wrap; }
+  .dev { border: 3px solid #2b3245; background: #fff; border-radius: 16px; display: flex; align-items: center;
+    justify-content: center; text-align: center; font-size: 11px; color: var(--muted); line-height: 1.4; padding: 4px; }
+  .dev b { color: var(--ink); display: block; font-size: 12px; }
+
+  .ask { background: var(--brand-soft); border: 1px solid #d6dafc; border-radius: 12px; padding: 18px 20px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <span class="badge">第 3 步 · 功能介绍与界面示意 · 待确认</span>
+    <h1>browser-mcp B 批：状态与模拟</h1>
+    <p>storage 读写登录态 · 请求拦截与 Mock · emulate 扩展设备、位置、时区、语言</p>
+  </div>
+</header>
+
+<nav><div class="wrap">
+  <a href="#s1">1 总览</a><a href="#s2">2 工具变化</a><a href="#s3">3 storage</a>
+  <a href="#s4">4 拦截与 Mock</a><a href="#s5">5 emulate 扩展</a><a href="#s6">6 默认选择与风险</a>
+</div></nav>
+
+<main>
+
+<section id="s1">
+  <h2><span class="no">1</span>总览</h2>
+  <p class="lead">下面所有输出文本都是示意，真实格式以技术文档和实现为准。设备预设的具体数值在技术文档里定稿。</p>
+  <div class="grid g4">
+    <div class="card stat"><div class="n">19 → 23</div><div class="t">工具总数</div></div>
+    <div class="card stat"><div class="n">4</div><div class="t">新增工具：storage、intercept_add / list / remove</div></div>
+    <div class="card stat"><div class="n">0</div><div class="t">新增权限与 npm 依赖</div></div>
+    <div class="card stat"><div class="n">1</div><div class="t">砍掉的功能：权限授予</div></div>
+  </div>
+  <div class="note">砍掉权限授予的原因：Chrome 文档里 <code>chrome.debugger</code> 可用的域不含 <code>Browser</code>，而授权方法都在这个域里。这个结论来自文档，还没在真实扩展里试过，编码第一步先用实验证实。<br>
+    本批不删除任何旧工具，<code>emulate</code> 只增加参数，旧调用保持可用。</div>
+</section>
+
+<section id="s2">
+  <h2><span class="no">2</span>工具变化</h2>
+  <p class="lead">四个新增，一个增强。</p>
+  <div class="card" style="padding:0;overflow:hidden">
+  <table>
+    <tr><th style="width:90px">类型</th><th style="width:200px">工具</th><th>说明</th></tr>
+    <tr><td><span class="tag t-new">新增</span></td><td><code>storage</code></td><td>读写 <code>localStorage</code> / <code>sessionStorage</code>，IndexedDB 只读摘要。走页面脚本，不依赖调试器</td></tr>
+    <tr><td><span class="tag t-new">新增</span></td><td><code>intercept_add</code></td><td>按 URL 加一条规则：让请求失败、返回假响应、或延迟放行</td></tr>
+    <tr><td><span class="tag t-new">新增</span></td><td><code>intercept_list</code></td><td>列出当前标签页的规则和命中次数</td></tr>
+    <tr><td><span class="tag t-new">新增</span></td><td><code>intercept_remove</code></td><td>删一条规则，或清空全部并关闭拦截</td></tr>
+    <tr><td><span class="tag t-up">增强</span></td><td><code>emulate</code></td><td>新增 <code>device</code> 预设与自定义视口、<code>geolocation</code>、<code>timezone</code>、<code>locale</code>，<code>reset</code> 一键还原</td></tr>
+  </table>
+  </div>
+  <p class="cap">拆成三个 intercept 工具的代价：每个工具描述都占用上下文，总数因此增加到 23 个。</p>
+</section>
+
+<section id="s3">
+  <h2><span class="no">3</span>storage：读写登录态</h2>
+  <p class="lead">很多站点把 token 放在 localStorage 而不是 Cookie。它和 <code>cookies</code> 配套，才能完整覆盖登录态。</p>
+
+  <div class="card" style="padding:0;overflow:hidden">
+  <table>
+    <tr><th style="width:110px">action</th><th>参数</th><th>说明</th></tr>
+    <tr><td><code>list</code></td><td><code>tabId</code> <code>area</code></td><td>列出键和值的摘要，长值截断。<code>area</code> 为 <code>local</code> 或 <code>session</code></td></tr>
+    <tr><td><code>get</code></td><td><code>tabId</code> <code>area</code> <code>key</code></td><td>取单个键的完整值，超过上限截断</td></tr>
+    <tr><td><code>set</code></td><td><code>tabId</code> <code>area</code> <code>key</code> <code>value</code></td><td>写入</td></tr>
+    <tr><td><code>remove</code></td><td><code>tabId</code> <code>area</code> <code>key</code></td><td>删除单个键</td></tr>
+    <tr><td><code>clear</code></td><td><code>tabId</code> <code>area</code></td><td>清空该区域</td></tr>
+    <tr><td><code>idb</code></td><td><code>tabId</code></td><td>IndexedDB 只读摘要：库、版本、对象仓库、记录数。不读记录内容，不写入</td></tr>
+  </table>
+  </div>
+
+  <h3>输出（示意）</h3>
+<pre><span class="k">storage</span> { action: "list", tabId: 101, area: "local" }
+
+localStorage of https://shop.example.com (4 keys):
+
+<span class="ok">token</span>        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjQy…"   <span class="c">(812 B, truncated)</span>
+<span class="ok">theme</span>        "dark"
+<span class="ok">cart:count</span>   "3"
+<span class="ok">lang</span>         "zh-CN"
+
+<span class="k">storage</span> { action: "idb", tabId: 101 }
+
+IndexedDB of https://shop.example.com (2 databases):
+
+cart-db  v3
+  items   ~ 12 records, keyPath: id
+  meta    ~ 1 record
+sync-db  v1
+  queue   ~ 0 records, autoIncrement</pre>
+  <p class="cap">记录数通过对象仓库的 <code>count()</code> 取得，打开数据库用当前版本，不会触发升级。</p>
+
+  <div class="grid g2" style="margin-top:14px">
+    <div class="card"><b>作用范围</b><br>只作用于该标签页主 frame 所在的源。iframe 的源不同，本批不支持，传了会得到明确提示。</div>
+    <div class="card"><b>敏感程度</b><br>能直接读写 token，和 <code>cookies</code> 工具同级敏感。README 的安全说明里会补一条。</div>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="no">4</span>请求拦截与 Mock</h2>
+  <p class="lead">模拟接口失败、慢响应和假数据，用来测前端的容错逻辑，也能屏蔽统计脚本。</p>
+
+  <h3>一条规则怎么生效（示意）</h3>
+  <div class="flow">
+    <div class="step"><b>1 页面发请求</b>浏览器暂停该请求</div><div class="arrow">→</div>
+    <div class="step"><b>2 匹配规则</b>URL 通配符 + 可选的 method</div><div class="arrow">→</div>
+    <div class="step"><b>3 执行行为</b>按规则处理</div>
+  </div>
+  <div class="branch">
+    <div class="br fail"><b>fail</b>让请求失败，可选原因：断网、拒绝连接、超时等</div>
+    <div class="br ful"><b>fulfill</b>返回自定义状态码、响应头、响应体，请求不会到真实服务器</div>
+    <div class="br dly"><b>delay</b>等待若干毫秒后原样放行</div>
+    <div class="br pass"><b>未匹配</b>立即放行，不影响页面</div>
+  </div>
+
+  <h3>三个工具（示意）</h3>
+<pre><span class="k">intercept_add</span> { tabId: 101, urlPattern: "*api.example.com/orders*", action: "fulfill",
+                 status: 500, headers: { "content-type": "application/json" },
+                 body: "{\"error\":\"mock\"}" }
+<span class="ok">Rule r1 added</span> (fulfill 500) on tab 101
+
+<span class="k">intercept_add</span> { tabId: 101, urlPattern: "*analytics*", action: "fail", errorReason: "BlockedByClient" }
+<span class="ok">Rule r2 added</span> (fail BlockedByClient) on tab 101
+
+<span class="k">intercept_add</span> { tabId: 101, urlPattern: "*/api/search*", method: "POST", action: "delay", delayMs: 3000 }
+<span class="ok">Rule r3 added</span> (delay 3000ms) on tab 101
+
+<span class="k">intercept_list</span> { tabId: 101 }
+Rules on tab 101 (3):
+r1  fulfill 500   *api.example.com/orders*      hits 4
+r2  fail          *analytics*                   hits 17
+r3  delay 3000ms  POST */api/search*            hits 0
+
+<span class="k">intercept_remove</span> { tabId: 101, ruleId: "r1" }     <span class="c">→ 删除 r1</span>
+<span class="k">intercept_remove</span> { tabId: 101 }                   <span class="c">→ 清空全部规则，并关闭拦截</span></pre>
+  <p class="cap">规则按添加顺序匹配，第一条命中的生效。规则只属于它所在的标签页，标签页关闭时一并清除。</p>
+
+  <div class="grid g2" style="margin-top:14px">
+    <div class="card"><b>风险一：规则丢失导致请求卡死</b><br>MV3 的 Service Worker 可能被浏览器回收。如果规则只在内存里，浏览器那边的拦截仍然开着，被暂停的请求没人放行，页面会一直卡住。<br>
+      做法：规则存进 <code>chrome.storage.session</code>，Service Worker 恢复后重新加载；恢复不了就主动关闭拦截。</div>
+    <div class="card"><b>风险二：页面跳转会断开调试器</b><br>现有代码在页面开始加载时会断开调试器，只有 trace 和 emulate 的标签页例外。拦截规则也要加进这个例外，否则跳转一次规则就失效。</div>
+  </div>
+  <div class="note"><code>fulfill</code> 的响应体先只支持文本。二进制响应体（图片等）留到后续批次。</div>
+</section>
+
+<section id="s5">
+  <h2><span class="no">5</span>emulate 扩展：设备、位置、时区、语言</h2>
+  <p class="lead">所有新参数并入现有 <code>emulate</code>，沿用 <code>reset:true</code> 一键还原，旧调用不受影响。</p>
+
+  <h3>内置设备预设（示意）</h3>
+  <div class="card">
+    <div class="devs">
+      <div class="dev" style="width:58px;height:120px"><div><b>iphone-15</b>393×852<br>@3x</div></div>
+      <div class="dev" style="width:62px;height:124px"><div><b>pixel-8</b>412×915<br>@2.625x</div></div>
+      <div class="dev" style="width:110px;height:152px"><div><b>ipad-air</b>820×1180<br>@2x</div></div>
+    </div>
+    <p class="cap">每个预设包含视口、像素比、触摸模拟、移动端标记和对应的移动端 User-Agent。也可以不用预设，直接传 <code>width</code>、<code>height</code>、<code>deviceScaleFactor</code>、<code>mobile</code> 自定义。</p>
+  </div>
+
+  <h3>参数一览</h3>
+  <div class="card" style="padding:0;overflow:hidden">
+  <table>
+    <tr><th style="width:200px">参数</th><th>说明</th></tr>
+    <tr><td><code>device</code></td><td><code>iphone-15</code> / <code>ipad-air</code> / <code>pixel-8</code>，一次设置视口、像素比、触摸、移动端 UA</td></tr>
+    <tr><td><code>width</code> <code>height</code> <code>deviceScaleFactor</code> <code>mobile</code></td><td>自定义视口。同时传 <code>device</code> 时，显式参数覆盖预设里对应的值</td></tr>
+    <tr><td><code>latitude</code> <code>longitude</code> <code>accuracy?</code></td><td>地理位置。经纬度必须成对传入</td></tr>
+    <tr><td><code>timezone</code></td><td>IANA 时区名，例如 <code>Asia/Tokyo</code></td></tr>
+    <tr><td><code>locale</code></td><td>语言区域，例如 <code>ja-JP</code>，影响 <code>navigator.language</code> 和日期数字格式</td></tr>
+    <tr><td><code>reset</code></td><td>清除本工具设置过的全部覆盖，包括新增的这几项</td></tr>
+  </table>
+  </div>
+
+  <h3>输出（示意）</h3>
+<pre><span class="k">emulate</span> { tabId: 101, device: "iphone-15", timezone: "Asia/Tokyo", locale: "ja-JP",
+           latitude: 35.68, longitude: 139.76 }
+
+Emulation applied: device iphone-15 (393x852 @3x, mobile, touch), timezone Asia/Tokyo, locale ja-JP,
+geolocation 35.68,139.76. Overrides last until the debugger detaches or reset:true.
+<span class="warn">Note: the page can only read the location if this site already has location permission in Chrome.</span></pre>
+
+  <div class="note">地理位置的限制：我们只能改“位置值”，不能代替用户授权。站点没有位置权限时页面会弹授权框，这个框点不了。需要先在 Chrome 里给该站点授权一次，这句话会写进工具描述。</div>
+</section>
+
+<section id="s6">
+  <h2><span class="no">6</span>默认选择与风险</h2>
+  <div class="grid g2">
+    <div class="card"><b>我替你做的默认选择（可推翻）</b><ul>
+      <li>预设只放 <code>iphone-15</code>、<code>ipad-air</code>、<code>pixel-8</code> 三个</li>
+      <li>设备 UA 里的浏览器版本取当前稳定版</li>
+      <li><code>storage</code> 不对值打码，和读写登录态的目的一致；<code>list</code> 里长值截断到 200 字符</li>
+      <li><code>storage</code> 只支持 <code>local</code> / <code>session</code> 的写入，IndexedDB 只读</li>
+      <li>拦截规则按标签页隔离，标签页关闭即清除</li>
+      <li><code>fulfill</code> 只支持文本响应体</li>
+      <li>不做权限授予</li></ul></div>
+    <div class="card"><b>风险与待验证</b><ul>
+      <li><code>Browser</code> 域被拒只是文档结论，编码第一步先实验</li>
+      <li><code>Fetch</code> 域在真实扩展里的行为，尤其和 <code>Network</code> 域同时开启时，需要实测</li>
+      <li>Service Worker 被回收后的规则恢复与兜底，要专门测</li>
+      <li><code>storage</code> 能直接改 token，需要在 README 安全说明里写明</li>
+      <li>工具总数增加到 23 个，上下文占用变大</li></ul></div>
+  </div>
+</section>
+
+<div class="ask">
+  <b>请确认</b>：这份功能介绍和示意图是否符合你的预期？确认后我产出技术设计文档（接口定义、模块拆分、数据结构、实验清单、手测清单），交你确认后再开始编码。
+</div>
+
+</main>
+</body>
+</html>

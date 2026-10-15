@@ -6,13 +6,13 @@
 
 **让 AI 助手直接操控你正在用的 Chrome。**
 
-一个 Chrome 扩展 + 本地 MCP Relay，把浏览器能力以 19 个工具的形式提供给 ZCode、Claude Code、pi 等任何支持 MCP 的客户端。
+一个 Chrome 扩展 + 本地 MCP Relay，把浏览器能力以 23 个工具的形式提供给 ZCode、Claude Code、pi 等任何支持 MCP 的客户端。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white)
 ![Chrome MV3](https://img.shields.io/badge/Chrome-Manifest%20V3-4285F4?logo=googlechrome&logoColor=white)
 ![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-8A2BE2)
-![Tools](https://img.shields.io/badge/tools-19-orange)
+![Tools](https://img.shields.io/badge/tools-23-orange)
 
 [GitHub](https://github.com/lycodeing/browser-mcp) · [Gitee 镜像](https://gitee.com/lycodeing/browser-mcp)
 
@@ -45,7 +45,7 @@ Relay 对 AI 一侧暴露 MCP 端点，对浏览器一侧运行 WebSocket 服务
 
 ## 功能一览
 
-19 个工具，按用途分四组。
+23 个工具，按用途分四组。
 
 ### 页面交互与读取
 
@@ -76,7 +76,10 @@ Relay 对 AI 一侧暴露 MCP 端点，对浏览器一侧运行 WebSocket 服务
 | `read_console_messages` | 读取控制台日志缓冲，可按正则和级别过滤 |
 | `network` | `list` 读取网络请求缓冲，每条带序号，失败请求显示原因（连接重置、CORS、被拦截等），可按 URL、方法、状态码（`404`、`4xx`、`500-599`）和 `failedOnly` 过滤；`detail` 按序号取请求头、响应头、POST 体和响应体，响应体超过 `bodyLimit` 时截断，可用 `saveTo` 落盘 |
 | `performance` | `metrics` 即时读取 LCP / CLS / INP / FCP / TTFB、JS 堆、DOM 节点数、监听器数、最慢资源；`trace_start` / `trace_stop` 录制 Chrome trace，返回长任务、阻塞时间、主线程耗时分布和最重脚本 |
-| `emulate` | CPU 降速、网络限速（Slow 3G / Fast 3G / Fast 4G / Offline）、深浅色模式、User-Agent 覆盖，`reset:true` 还原 |
+| `emulate` | 设备预设（`iphone-15` / `ipad-air` / `pixel-8`）或自定义宽高、像素比、移动端；地理位置、时区、语言；CPU 降速、网络限速（Slow 3G / Fast 3G / Fast 4G / Offline）、深浅色模式、User-Agent 覆盖，`reset:true` 一键还原。地理位置只有在站点已获得定位权限时页面才读得到，本工具无法授予权限 |
+| `intercept_add` | 对标签页的请求加规则（按 URL 通配符，可限定方法）：`fail` 模拟网络错误、`fulfill` 返回 Mock 响应、`delay` 延迟放行。跨域 Mock 自动补 `access-control-allow-origin` 并应答 CORS 预检，每个标签页最多 50 条，先匹配到的规则生效 |
+| `intercept_list` | 列出标签页的规则、命中次数，以及拦截当前是否生效 |
+| `intercept_remove` | 按 id 删除一条规则，不传 `ruleId` 则清空并关闭拦截 |
 
 ### 数据与产物
 
@@ -84,6 +87,7 @@ Relay 对 AI 一侧暴露 MCP 端点，对浏览器一侧运行 WebSocket 服务
 |------|------|
 | `save_pdf` | 页面导出 PDF 到本地，纸张、方向、背景可配 |
 | `cookies` | 读取、注入、删除、清除指定域的 Cookie |
+| `storage` | 读写主 frame 的 `localStorage` / `sessionStorage`（`list` / `get` / `set` / `remove` / `clear`），`idb` 只读列出 IndexedDB 的库、对象仓库和记录数，不读记录内容。不支持 iframe，每次结果首行显示操作的源 |
 | `downloads` | 列出下载，等待完成并返回本地文件路径，清除历史 |
 
 ### 截图与 token 优化
@@ -124,7 +128,7 @@ npm start
 3. 点击 **加载已解压的扩展程序**，选择本项目的 `extension/` 目录
 4. 点击工具栏里的扩展图标，状态显示 **Connected** 即成功
 
-扩展会自动连接本地 Relay，断线后按 1s、2s、5s、10s、30s 的间隔重试，所以先装扩展还是先启动 Relay 都可以。
+扩展会自动连接本地 Relay，断线后按 1s、2s、5s、10s、30s 的间隔重试，所以先装扩展还是先启动 Relay 都可以。扩展的 Service Worker 被 Chrome 回收后，每 30 秒的定时闹钟会把它唤醒并重新连接。
 
 ### 3. 配置 MCP 客户端
 
@@ -207,6 +211,9 @@ computer  { action: "left_click", tabId, ref: "ref_42" }
 
 - **排查前端问题**：`read_console_messages` 看报错，`network` 看失败的请求及原因，再用 `detail` 取响应体，`javascript_tool` 现场执行代码。
 - **性能与弱网测试**：先用 `emulate` 限速并降 CPU，再用 `performance` 抓指标或录 trace。
+- **移动端与地区测试**：`emulate` 选设备预设，再设时区和语言，看页面在手机视口、不同地区下的表现。
+- **接口异常与 Mock**：`intercept_add` 让某个接口失败、变慢或返回假数据，不用改后端就能验证前端的错误处理；用完 `intercept_remove` 清掉。
+- **登录态与本地存储**：`storage` 查看或改写 `localStorage` 里的 token、开关，`idb` 先看有哪些库再决定怎么查。
 - **表单与文件**：`form_input` 填字段，`file_upload` 传文件，`save_pdf` 把结果导出。
 
 ## 配置
@@ -227,6 +234,8 @@ EXT_PORT=16789 MCP_PORT=3000 npm start
 - Relay 的两个服务都只监听 `127.0.0.1`，局域网内其他机器连不上。
 - **没有鉴权**：本机上的任何进程都能调用 MCP 端点，进而操作你的浏览器，包括读取 Cookie 和执行页面脚本。请只在你信任的环境里运行，不要把端口转发或暴露出去。
 - `network` 的 `detail` 能读取页面请求的头、POST 体和响应体，与 `cookies` 工具同级敏感。`authorization`、`cookie` 等请求头默认显示为 `****`，传 `rawHeaders:true` 才原样输出。
+- `storage` 能直接读写页面的 `localStorage` / `sessionStorage`，包括 token 等登录态，值不打码，与 `cookies` 同级敏感。
+- `intercept_add` 的规则会改变页面收到的响应，只作用于你指定的标签页。规则存放在扩展的会话存储里，浏览器退出后消失。
 - 扩展申请了 `debugger`、`cookies`、`<all_urls>` 等较大的权限，这是实现截图、网络监听和 Cookie 管理所必需的。
 
 ## 开发
@@ -258,7 +267,7 @@ browser-mcp/
 └── extension/                  # Chrome 扩展 (Manifest V3)
     ├── manifest.json
     ├── background.js           # Service Worker，工具实现与消息路由
-    ├── lib/                    # 纯逻辑模块（队列、URL、标签组、超时），可用 node --test 测试
+    ├── lib/                    # 纯逻辑模块（队列、URL、标签组、超时、emulate、storage、intercept），可用 node --test 测试
     ├── tools/                  # 依赖 chrome.* 的工具实现，依赖通过参数注入
     ├── test/
     ├── popup.html / popup.js   # 状态弹窗
