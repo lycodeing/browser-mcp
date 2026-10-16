@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   TAB_GROUP_COLORS, groupColor, findGroupByTitle, normalizeGroupName, isSystemUrl, formatTabList,
+  tabNotFoundMessage,
 } from '../lib/tabs.js';
 import { isRestrictedUrl, normalizeUrl } from '../lib/url.js';
 
@@ -153,4 +154,33 @@ test('formatTabList 按 group 名字过滤', () => {
 
   const none = formatTabList(tabs, groups, { group: 'no-such-group' });
   assert.ok(none.startsWith('Open tabs (0,'), `应列出 0 个: ${none.split('\n')[0]}`);
+});
+
+// ── tabNotFoundMessage：tab 不存在时的自纠错文案 ─────────────────────────────
+
+test('tabNotFoundMessage 附 tabs list 指引与现存标签页', () => {
+  const tabs = [
+    { id: 1924551535, title: '控制台', url: 'https://example.com/console' },
+    { id: 1924550748, title: '文档', url: 'https://example.com/docs' },
+  ];
+  const msg = tabNotFoundMessage(3, tabs);
+  assert.ok(msg.includes('Tab 3 not found'), '指明不存在的 id');
+  assert.ok(msg.includes('tabs tool (action: "list")'), '指引正确的获取方式');
+  assert.ok(msg.includes('[1924551535] "控制台"'), '列出真实标签页');
+  assert.ok(msg.includes('[1924550748] "文档"'), '列出第二个标签页');
+});
+
+test('tabNotFoundMessage 空标签列表、标题截断与上限', () => {
+  assert.ok(tabNotFoundMessage(3, null).includes('(none)'), '空列表回退 (none)');
+  const longTitle = 'x'.repeat(80);
+  const msg = tabNotFoundMessage(3, [{ id: 1, title: longTitle, url: 'https://a.com' }]);
+  assert.ok(!msg.includes(longTitle), '标题超 60 字符被截断');
+  const many = Array.from({ length: 15 }, (_, i) => ({ id: i, title: `t${i}`, url: `https://t${i}.com` }));
+  const lines = tabNotFoundMessage(3, many).split('\n').filter(l => l.startsWith('['));
+  assert.equal(lines.length, 10, '最多列 10 行');
+});
+
+test('tabNotFoundMessage 缺省标题回退 Untitled', () => {
+  const msg = tabNotFoundMessage(3, [{ id: 1, url: 'https://a.com' }]);
+  assert.ok(msg.includes('"Untitled"'));
 });

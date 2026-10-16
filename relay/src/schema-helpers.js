@@ -30,9 +30,15 @@ function numberItems() {
   return z.array(z.union([z.number(), z.string().regex(NUMERIC)])).transform((items) => items.map(Number));
 }
 
+/** 数字或可还原为数字的字符串；message 用于两种都失败时的错误提示 */
+const NUMERIC_GUIDANCE = 'expected a number or a numeric string like "123" (no units, no letters)';
+function numericString(message) {
+  return z.string().regex(NUMERIC, message);
+}
+
 /** base 为带约束的 z.number()，约束同时用于公布的 schema 与转换后的校验 */
-export function lenientNumber(base = z.number()) {
-  return z.union([base, z.string().regex(NUMERIC)]).transform(Number).pipe(base);
+export function lenientNumber(base = z.number(), message = NUMERIC_GUIDANCE) {
+  return z.union([base, numericString(message)]).transform(Number).pipe(base);
 }
 
 export function lenientBoolean() {

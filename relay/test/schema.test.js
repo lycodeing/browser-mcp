@@ -315,3 +315,67 @@ test('intercept_add 的 bodyBase64 透传给扩展', async () => {
   assert.equal(received[0].tool, 'intercept_add');
   assert.equal(received[0].arguments.bodyBase64, b64);
 });
+
+// ── 错误消息自纠错：三类高频调用错误必须带可执行的指引 ────────────────────────
+
+test('tabId 传 UUID 时校验错误附 tabs list 指引', async () => {
+  setExtensionWs(fakeWs);
+  const client = await connectClient();
+  const res = await client.callTool({
+    name: 'computer', arguments: { action: 'screenshot', tabId: 'bc494367-83d3-495f' },
+  });
+  assert.equal(res.isError, true);
+  const text = res.content[0].text;
+  assert.match(text, /numeric Chrome tab id/);
+  // 文本经 JSON 转义，引号形如 \"list\"，不做精确引号匹配
+  assert.match(text, /tabs \(action/);
+  assert.match(text, /tabId/);
+});
+
+test('computer 传入其它工具的 action 时错误附正确替代工具', async () => {
+  setExtensionWs(fakeWs);
+  const client = await connectClient();
+  for (const [action, hint] of [
+    ['find', /find tool with \{query\}/],
+    ['navigate', /navigate tool with \{url\}/],
+    ['wait_for', /wait_for tool/],
+    ['get_page_text', /get_page_text tool/],
+    ['read_page', /read_page tool/],
+  ]) {
+    const res = await client.callTool({
+      name: 'computer', arguments: { action, tabId: 1 },
+    });
+    assert.equal(res.isError, true, `${action} 应被拒绝`);
+    const text = res.content[0].text;
+    assert.match(text, new RegExp(`computer does not support action.{0,3}${action}`));
+    assert.match(text, hint);
+  }
+});
+
+test('computer 支持的动作不受 errorMap 影响', async () => {
+  setExtensionWs(fakeWs);
+  received.length = 0;
+  const client = await connectClient();
+  const res = await client.callTool({
+    name: 'computer', arguments: { action: 'wait', tabId: '5', duration: '1' },
+  });
+  assert.notEqual(res.isError, true, JSON.stringify(res));
+  assert.equal(received[0].arguments.action, 'wait');
+  assert.equal(received[0].arguments.tabId, 5);
+});
+
+test('所有带必填 tabId 的工具公布 tabId 指引描述', async () => {
+  const client = await connectClient();
+  const { tools } = await client.listTools();
+  // tabs 的 tabId 是可选参数（仅 activate/reload/duplicate 用），描述另论
+  const withTabId = tools.filter((t) => t.name !== 'tabs' && t.inputSchema.properties?.tabId);
+  assert.ok(withTabId.length >= 19, `应有 ≥19 个带必填 tabId 的工具，实际 ${withTabId.length}`);
+  for (const t of withTabId) {
+    // 校验 description 字段本身（JSON.stringify 会把引号转义，不能对整体字符串 includes）
+    const desc = t.inputSchema.properties.tabId.description || '';
+    assert.ok(
+      desc.includes('tabs (action: "list")'),
+      `${t.name} 的 tabId 描述应包含 tabs list 指引: ${desc.slice(0, 120)}`,
+    );
+  }
+});

@@ -5,6 +5,7 @@ import { createTabQueue, TabBusyError } from './lib/tab-queue.js';
 import { withTimeout } from './lib/timeout.js';
 import { normalizeUrl } from './lib/url.js';
 import { createTabsTool } from './tools/tabs.js';
+import { tabNotFoundMessage } from './lib/tabs.js';
 import { createNetworkStore } from './lib/network.js';
 import { createNetworkTool } from './tools/network.js';
 import { createEmulateTool } from './tools/emulate.js';
@@ -117,9 +118,20 @@ async function cdpDetach(tabId) {
   cdpReady.delete(tabId);
 }
 
+// chrome.tabs.get 对不存在 id 抛 "No tab with id: N" 且不带任何上下文，
+// 调用方（模型）常拿猜测的短编号重试。这里统一包一层：附上当前标签列表与正确获取方式。
+async function getTab(tabId) {
+  try {
+    return await chrome.tabs.get(tabId);
+  } catch (e) {
+    const tabs = await chrome.tabs.query({}).catch(() => []);
+    throw new Error(tabNotFoundMessage(tabId, tabs));
+  }
+}
+
 async function ensureCdp(tabId) {
   if (cdpReady.has(tabId)) return;
-  const tab = await chrome.tabs.get(tabId);
+  const tab = await getTab(tabId);
   const url = tab.url || '';
   if (/^(chrome|chrome-extension|devtools|about|edge):/.test(url))
     throw new Error(`Cannot attach CDP to restricted URL: ${url}`);
@@ -128,6 +140,7 @@ async function ensureCdp(tabId) {
 
 // 内容脚本自带幂等守卫，每次调用对所有 frame 注入即可；新出现的 iframe 在下一次调用时被覆盖
 async function ensureCs(tabId) {
+  await getTab(tabId); // 不存在的 tabId 提前失败并附标签列表，而不是注入报无上下文的错
   await chrome.scripting.executeScript({
     target: { tabId, allFrames: true },
     files: ['content-scripts/accessibility-tree.js', 'content-scripts/page-bridge.js',
@@ -599,7 +612,7 @@ async function toolNavigate(args) {
 async function navigateImpl({tabId, url, force=false}) {
 
   if (url === 'back' || url === 'forward') {
-    const before = (await chrome.tabs.get(tabId)).url;
+    const before = (await getTab(tabId)).url;
     try {
       url === 'back' ? await chrome.tabs.goBack(tabId) : await chrome.tabs.goForward(tabId);
     } catch {
@@ -607,7 +620,7 @@ async function navigateImpl({tabId, url, force=false}) {
         func:d=>d==='back'?history.back():history.forward(), args:[url]});
     }
     await waitForLoad(tabId, 5000);
-    const after = (await chrome.tabs.get(tabId));
+    const after = (await getTab(tabId));
     if (after.url === before) return ok([{type:'text',text:`Cannot go ${url}: no page in history`}]);
     return ok([{type:'text',text:`Navigated ${url} to: ${after.url}\nTitle: ${after.title}`}]);
   }
@@ -619,7 +632,7 @@ async function navigateImpl({tabId, url, force=false}) {
   const t0 = Date.now();
   await chrome.tabs.update(tabId, {url: finalUrl});
   await waitForLoad(tabId, 10000);
-  const tab = await chrome.tabs.get(tabId);
+  const tab = await getTab(tabId);
   const ms = ((Date.now()-t0)/1000).toFixed(1);
   const redir = tab.url !== finalUrl ? ` (redirected from ${finalUrl})` : '';
   return ok([{type:'text',text:`Navigated to: ${tab.url}${redir}\nTitle: ${tab.title}\nDuration: ${ms}s`}]);

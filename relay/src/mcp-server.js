@@ -21,14 +21,46 @@ import {
 const Coordinate = lenientNumberTuple(2).describe('(x, y) pixel coordinates');
 const Region = lenientNumberTuple(4).describe('(x0, y0, x1, y1) rectangle');
 
+// tabId 传成 UUID / 短编号是高频错误；describe 会进入客户端看到的工具清单，
+// zod 校验失败时只透出第一个 issue 的 message，所以字符串分支也要挂同样的指引
+const TABID_GUIDANCE = 'tabId must be the numeric Chrome tab id from tabs (action: "list"), e.g. 1924551535 — not a UUID or made-up short number';
+
+export function lenientTabId() {
+  return num(
+    z.number({ required_error: TABID_GUIDANCE, invalid_type_error: TABID_GUIDANCE }),
+    TABID_GUIDANCE,
+  ).describe(TABID_GUIDANCE);
+}
+
+// computer 不承载检索/导航/等待类动作；枚举失败消息里直接给出正确替代工具
+const COMPUTER_ACTIONS = [
+  'left_click', 'right_click', 'double_click', 'triple_click',
+  'type', 'key', 'screenshot', 'wait', 'scroll', 'scroll_to',
+  'left_click_drag', 'zoom', 'hover',
+];
+const ACTION_ALIASES = {
+  find: 'use the find tool with {query}',
+  read_page: 'use the read_page tool',
+  get_page_text: 'use the get_page_text tool',
+  navigate: 'use the navigate tool with {url}',
+  wait_for: 'use the wait_for tool, or action "wait" with duration for a plain sleep',
+  form_input: 'use the form_input tool with {ref, value}',
+  javascript_tool: 'use the javascript_tool tool with {text}',
+};
+
+const computerActionSchema = z.enum(COMPUTER_ACTIONS, {
+  errorMap: (issue, ctx) => {
+    if (issue.code === 'invalid_enum_value' && issue.received in ACTION_ALIASES) {
+      return { message: `computer does not support action "${issue.received}": ${ACTION_ALIASES[issue.received]}` };
+    }
+    return { message: ctx.defaultError };
+  },
+}).describe('Action to perform');
+
 const SCHEMAS = {
   computer: {
-    action: z.enum([
-      'left_click', 'right_click', 'double_click', 'triple_click',
-      'type', 'key', 'screenshot', 'wait', 'scroll', 'scroll_to',
-      'left_click_drag', 'zoom', 'hover',
-    ]).describe('Action to perform'),
-    tabId: num().describe('Target tab ID'),
+    action: computerActionSchema,
+    tabId: lenientTabId(),
     coordinate: Coordinate.optional(),
     start_coordinate: Coordinate.optional().describe('Drag start position'),
     region: Region.optional().describe('Region for zoom action [x0,y0,x1,y1]'),
@@ -52,53 +84,53 @@ const SCHEMAS = {
       .describe('JS dialog policy during this action: auto-accept (default), auto-dismiss, or manual via handle_dialog'),
   },
   read_page: {
-    tabId: num().describe('Target tab ID'),
+    tabId: lenientTabId(),
     filter: z.enum(['all', 'interactive']).optional().default('all'),
     depth: num(z.number().min(1).max(50)).optional().default(15),
     max_chars: num(z.number().min(1000).max(200000)).optional().default(50000),
     ref_id: z.string().optional().describe('Focus on a specific element subtree'),
   },
   find: {
-    tabId: num(),
+    tabId: lenientTabId(),
     query: z.string().describe('Keywords matching element text or label'),
     max_results: num(z.number().min(1).max(100)).optional().default(20),
   },
   form_input: {
-    tabId: num(),
+    tabId: lenientTabId(),
     ref: z.string().describe('Element ref from read_page or find'),
     value: z.union([z.string(), z.boolean(), z.number()]),
   },
   navigate: {
-    tabId: num(),
+    tabId: lenientTabId(),
     url: z.string().describe('URL, "back", or "forward"'),
     force: bool().optional().describe('Dismiss unsaved-changes dialogs'),
     dialog: z.enum(['accept', 'dismiss', 'manual']).optional()
       .describe('JS dialog policy during navigation: auto-accept (default), auto-dismiss, or manual'),
   },
   javascript_tool: {
-    tabId: num(),
+    tabId: lenientTabId(),
     frameId: num(z.number().int().min(0)).optional().describe('Frame to run the code in: 0 = main frame (default), f<id> from read_page output for iframes'),
     text: z.string().min(1).describe('JS code to run (no return statement needed)'),
   },
   get_page_text: {
-    tabId: num(),
+    tabId: lenientTabId(),
     frameId: num(z.number().int().min(0)).optional().describe('Extract text from this frame only: 0 = main frame (default), f<id> for iframes'),
     allFrames: bool().optional().describe('Merge text from every frame, each section headed by its frame'),
     max_chars: num(z.number().min(1000).max(200000)).optional().default(50000),
   },
   file_upload: {
-    tabId: num(),
+    tabId: lenientTabId(),
     paths: z.array(z.string()).min(1).describe('Absolute file paths to upload'),
     ref: z.string().optional().describe('Ref of input[type=file] element; iframes refs like f3.ref_7 work'),
     triggerRef: z.string().optional().describe('Ref of button that opens file picker; iframes refs work too'),
   },
   resize_window: {
-    tabId: num(),
+    tabId: lenientTabId(),
     width: num(z.number().min(400).max(7680)),
     height: num(z.number().min(300).max(4320)),
   },
   read_console_messages: {
-    tabId: num(),
+    tabId: lenientTabId(),
     pattern: z.string().optional().describe('Regex filter for message content'),
     onlyErrors: bool().optional().default(false),
     clear: bool().optional().default(false),
@@ -106,7 +138,7 @@ const SCHEMAS = {
   },
   network: {
     action: z.enum(['list', 'detail']).describe('What to do with observed network requests'),
-    tabId: num().describe('Target tab ID'),
+    tabId: lenientTabId(),
     urlPattern: z.string().optional().describe('list: filter by URL substring'),
     method: z.string().optional().describe('list: HTTP method filter, case-insensitive'),
     status: z.string().optional().describe('list: "404", "4xx" or "500-599"'),
@@ -133,7 +165,7 @@ const SCHEMAS = {
     bypassCache: bool().optional().describe('reload: skip the cache'),
   },
   wait_for: {
-    tabId: num().describe('Target tab ID'),
+    tabId: lenientTabId(),
     condition: z.enum(['element', 'element_gone', 'url', 'network_idle', 'time'])
       .describe('What to wait for'),
     text: z.string().optional().describe('element/element_gone: text to match (same semantics as find)'),
@@ -143,12 +175,12 @@ const SCHEMAS = {
     timeoutMs: num(z.number().min(1000).max(120000)).optional().default(15000),
   },
   handle_dialog: {
-    tabId: num().describe('Target tab ID'),
+    tabId: lenientTabId(),
     accept: bool().optional().default(true).describe('true=accept/OK, false=dismiss/cancel'),
     promptText: z.string().optional().describe('Text for prompt() dialogs'),
   },
   save_pdf: {
-    tabId: num().describe('Target tab ID'),
+    tabId: lenientTabId(),
     saveTo: z.string().describe('Absolute local path to save the PDF'),
     paperFormat: z.enum(['Letter','Legal','Tabloid','Ledger','A0','A1','A2','A3','A4','A5','A6']).optional().default('A4'),
     landscape: bool().optional().default(false),
@@ -178,12 +210,12 @@ const SCHEMAS = {
       .describe('wait: give up if not complete'),
   },
   performance: {
-    tabId: num().describe('Target tab ID'),
+    tabId: lenientTabId(),
     action: z.enum(['metrics', 'trace_start', 'trace_stop']).describe('metrics: instant snapshot; trace_start/trace_stop: record a trace and get an analysed summary'),
     reload: bool().optional().default(false).describe('trace_start: reload the page (cache bypassed) once tracing begins, to capture load metrics'),
   },
   emulate: {
-    tabId: num().describe('Target tab ID'),
+    tabId: lenientTabId(),
     cpuThrottlingRate: num(z.number().min(1).max(20)).optional().describe('CPU slowdown factor, 1 = off'),
     networkConditions: z.enum(['Offline', 'Slow 3G', 'Fast 3G', 'Fast 4G', 'none']).optional().describe('Network throttling preset, none = off'),
     colorScheme: z.enum(['dark', 'light', 'auto']).optional().describe('prefers-color-scheme override, auto = reset'),
@@ -202,7 +234,7 @@ const SCHEMAS = {
   },
   storage: {
     action: z.enum(['list', 'get', 'set', 'remove', 'clear', 'idb']).describe('Storage operation'),
-    tabId: num().describe('Target tab ID'),
+    tabId: lenientTabId(),
     area: z.enum(['local', 'session']).optional().describe('list/get/set/remove/clear: which storage, default local'),
     key: z.string().optional().describe('get/set/remove: key'),
     value: z.string().optional().describe('set: value (strings only; JSON.stringify objects first)'),
@@ -210,7 +242,7 @@ const SCHEMAS = {
       .describe('get: max characters of the value returned inline'),
   },
   intercept_add: {
-    tabId: num().describe('Target tab ID'),
+    tabId: lenientTabId(),
     urlPattern: z.string().min(1).describe('Wildcard pattern matched against the whole URL: * is zero or more characters, ? is exactly one, backslash escapes the next character'),
     action: z.enum(['fail', 'fulfill', 'delay']).describe('fail: abort the request; fulfill: answer with a mock response; delay: hold the request, then let it through'),
     method: z.string().optional().describe('Only match this HTTP method, case-insensitive'),
@@ -226,10 +258,10 @@ const SCHEMAS = {
     delayMs: num(z.number().int().min(1).max(60000)).optional().describe('delay: milliseconds to hold each matching request (required for delay)'),
   },
   intercept_list: {
-    tabId: num().describe('Target tab ID'),
+    tabId: lenientTabId(),
   },
   intercept_remove: {
-    tabId: num().describe('Target tab ID'),
+    tabId: lenientTabId(),
     ruleId: z.string().optional().describe('Rule id from intercept_list; omit to remove all rules and turn interception off'),
   },
 };
@@ -298,7 +330,7 @@ export const TOOL_TIMEOUTS = Object.fromEntries(
 export function buildMcpServer() {
   const server = new McpServer({
     name: 'browser-mcp',
-    version: '2.2.0',
+    version: '2.2.2',
   });
 
   for (const [name, schema] of Object.entries(SCHEMAS)) {
@@ -472,7 +504,7 @@ export function startMcpServer(port = 3000) {
     const info = getExtensionInfo();
     res.json({
       service: 'browser-mcp-relay',
-      version: '2.2.0',
+      version: '2.2.2',
       extension: info,
     });
   });

@@ -51,3 +51,12 @@ export function formatTabList(tabs, groups, { group } = {}) {
   const suffix = group ? `, group "${group}"` : '';
   return `Open tabs (${filtered.length}${suffix}):\n\n${lines.join('\n')}`;
 }
+
+// tabId 不存在时的错误文案：附上真实存在的标签页（最多 max 行），让调用方可自纠，
+// 而不是只有 chrome 原生的 "No tab with id: N"。
+export function tabNotFoundMessage(tabId, tabs, { max = 10 } = {}) {
+  const lines = (tabs || []).slice(0, max).map(t =>
+    `[${t.id}] "${String(t.title || 'Untitled').slice(0, 60)}" ${t.url}`);
+  return `Tab ${tabId} not found. tabId is the numeric Chrome tab id; list real ones with the tabs tool (action: "list"). `
+    + `Open tabs:\n${lines.join('\n') || '(none)'}`;
+}
