@@ -2,6 +2,27 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。工具数量与接口以 README 为准。
 
+## [2.3.0] — 2026-10-18
+
+### 变更（破坏性）
+- `network` 拆分为 `network_list` / `network_detail`：list 只保留过滤参数，detail 必须传 `seq`。
+- `tabs` 拆分为 `tabs_list` / `tab_create` / `tab_close` / `tab_activate` / `tab_reload` / `tab_duplicate` / `tab_group`：每个工具只保留自己用到的参数。
+- `emulate` 拆分为 `emulate_device` / `emulate_network` / `emulate_geo`：colorScheme 不再暴露，UA 覆盖归入 `emulate_device`，`reset:true` 由 `emulate_device` 承载。
+- `computer` 的高频动作拆出为顶层工具：`screenshot` / `click` / `sleep`。`computer` 保留拖拽、悬停、区域缩放、右键、三击等高级用法。
+- 截图工具 `saveTo` 存在且未显式传 `returnImage:true` 时，不再把 base64 图塞进上下文，只返回落盘路径。
+
+### 新增
+- `state`：一屏获取当前浏览器状态（活动标签 id/URL/标题、frame 数、待处理弹窗、网络缓冲、控制台错误数、拦截规则数）。
+- `form_input_multi`：一次填写多个字段（最多 20 个），第一个失败即停止并报告。
+- `click`：按 `ref`（优先）或坐标点击，支持双击/三击/右键。
+- `screenshot`：独立截图工具，支持 `fullPage`、`region` 裁剪、`saveTo` 落盘。
+- `sleep`：固定等待秒数。
+
+### 改进
+- Relay 启动时自动清理 `os.tmpdir()/browser-mcp/` 下超过 1 小时的临时截图，防止磁盘膨胀。
+- 工具描述按拆分后的职责重写，总长度从 ~10 KB 降至 ~4 KB，减少每次会话的固定 token 开销。
+- `computer` 描述新增引导：优先 `read_page → find → form_input → click via ref`，截图仅在需要视觉确认时使用。
+
 ## [2.2.3] — 2026-10-18
 
 手测阶段发现并修复的问题，以及开发体验改进。

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "browser-mcp",
-  "version": "2.2.3",
+  "version": "2.3.0",
   "description": "Browser automation bridge for ZCode / Claude Code via MCP",
   "permissions": [
     "debugger",

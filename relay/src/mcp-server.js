@@ -416,7 +416,7 @@ const SHAPE_REFINEMENTS = {
 export function buildMcpServer() {
   const server = new McpServer({
     name: 'browser-mcp',
-    version: '2.2.3',
+    version: '2.3.0',
   });
 
   for (const [name, schema] of Object.entries(SCHEMAS)) {
@@ -625,7 +625,7 @@ export function startMcpServer(port = 3000) {
     const info = getExtensionInfo();
     res.json({
       service: 'browser-mcp-relay',
-      version: '2.2.3',
+      version: '2.3.0',
       extension: info,
     });
   });
