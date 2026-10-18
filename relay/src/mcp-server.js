@@ -23,7 +23,7 @@ const Region = lenientNumberTuple(4).describe('(x0, y0, x1, y1) rectangle');
 
 // tabId 传成 UUID / 短编号是高频错误；describe 会进入客户端看到的工具清单，
 // zod 校验失败时只透出第一个 issue 的 message，所以字符串分支也要挂同样的指引
-const TABID_GUIDANCE = 'tabId must be the numeric Chrome tab id from tabs (action: "list"), e.g. 1924551535 — not a UUID or made-up short number';
+const TABID_GUIDANCE = 'tabId must be the numeric Chrome tab id from tabs_list, e.g. 1924551535 — not a UUID or made-up short number';
 
 export function lenientTabId() {
   return num(
@@ -46,6 +46,8 @@ const ACTION_ALIASES = {
   wait_for: 'use the wait_for tool, or action "wait" with duration for a plain sleep',
   form_input: 'use the form_input tool with {ref, value}',
   javascript_tool: 'use the javascript_tool tool with {text}',
+  click: 'use the click tool with {ref} or {coordinate}',
+  sleep: 'use the sleep tool with {seconds}',
 };
 
 const computerActionSchema = z.enum(COMPUTER_ACTIONS, {
@@ -82,6 +84,33 @@ const SCHEMAS = {
     returnImage: bool().optional().describe('With saveTo: false to skip returning image data'),
     dialog: z.enum(['accept', 'dismiss', 'manual']).optional()
       .describe('JS dialog policy during this action: auto-accept (default), auto-dismiss, or manual via handle_dialog'),
+  },
+  // computer 的高频动作拆出的顶层工具：模型直接按工具名调用，省去选 action 的一步
+  screenshot: {
+    tabId: lenientTabId(),
+    format: z.enum(['jpeg', 'webp', 'png']).optional().describe('default jpeg'),
+    quality: z.union([z.enum(['low', 'medium', 'high']), num(z.number().int().min(1).max(100))]).optional(),
+    fullPage: bool().optional(),
+    maxDimension: num(z.number().int().min(400).max(8000)).optional().describe('Longest edge in px, default 1280'),
+    saveTo: z.string().optional(),
+    returnImage: bool().optional(),
+    region: Region.optional().describe('Region [x0,y0,x1,y1] in screenshot pixels for detail zoom'),
+    dialog: z.enum(['accept', 'dismiss', 'manual']).optional(),
+  },
+  // click 必须给 ref 或 coordinate 之一：两者都 optional 时 zod 表达不了互斥必填。
+  // buildMcpServer 把 shape 包成 z.object 后统一挂 refine（SDK 的 tool() 只收 raw shape）
+  click: {
+    tabId: lenientTabId(),
+    ref: z.string().optional().describe('Element ref from read_page or find; prefer over coordinate'),
+    coordinate: Coordinate.optional().describe('(x, y) in screenshot pixels if no ref'),
+    button: z.enum(['left', 'right', 'middle']).optional().default('left'),
+    double: bool().optional().default(false).describe('Double-click'),
+    triple: bool().optional().default(false).describe('Triple-click'),
+    dialog: z.enum(['accept', 'dismiss', 'manual']).optional(),
+  },
+  sleep: {
+    tabId: lenientTabId(),
+    seconds: num(z.number().min(0).max(10)).describe('Wait duration'),
   },
   read_page: {
     tabId: lenientTabId(),
@@ -136,33 +165,50 @@ const SCHEMAS = {
     clear: bool().optional().default(false),
     limit: num(z.number().min(1).max(1000)).optional().default(100),
   },
-  network: {
-    action: z.enum(['list', 'detail']).describe('What to do with observed network requests'),
+  network_list: {
     tabId: lenientTabId(),
-    urlPattern: z.string().optional().describe('list: filter by URL substring'),
-    method: z.string().optional().describe('list: HTTP method filter, case-insensitive'),
-    status: z.string().optional().describe('list: "404", "4xx" or "500-599"'),
+    urlPattern: z.string().optional().describe('Filter by URL substring'),
+    method: z.string().optional().describe('HTTP method filter, case-insensitive'),
+    status: z.string().optional().describe('"404", "4xx" or "500-599"'),
     failedOnly: bool().optional().default(false)
-      .describe('list: network failures and HTTP status >= 400'),
-    limit: num(z.number().min(1).max(1000)).optional().default(100).describe('list: max entries to return'),
-    clear: bool().optional().default(false).describe('list: clear the buffer after reading (seq is not reset)'),
-    seq: num(z.number().int().min(1)).optional().describe('detail: request number (#N) shown by list'),
-    bodyLimit: num(z.number().int().min(500).max(200000)).optional().default(20000)
-      .describe('detail: max response body characters returned inline'),
-    rawHeaders: bool().optional().default(false)
-      .describe('detail: show authorization/cookie header values as-is instead of masked'),
-    saveTo: z.string().optional().describe('detail: absolute local path to save the full response body'),
+      .describe('Network failures and HTTP status >= 400'),
+    limit: num(z.number().min(1).max(1000)).optional().default(100).describe('Max entries to return'),
+    clear: bool().optional().default(false).describe('Clear the buffer after reading (seq is not reset)'),
   },
-  tabs: {
-    action: z.enum(['list', 'create', 'close', 'activate', 'reload', 'duplicate', 'group'])
-      .describe('Tab operation'),
-    tabId: num().optional().describe('activate/reload/duplicate: target tab'),
-    tabIds: lenientNumberArray().optional().describe('close/group: target tabs'),
-    url: z.string().optional().describe('create: URL to open, omitted opens about:blank'),
-    active: bool().optional().describe('create: focus the new tab, default true'),
+  network_detail: {
+    tabId: lenientTabId(),
+    seq: num(z.number().int().min(1)).describe('Request number (#N) from network_list'),
+    bodyLimit: num(z.number().int().min(500).max(200000)).optional().default(20000)
+      .describe('Max response body characters returned inline'),
+    rawHeaders: bool().optional().default(false)
+      .describe('Show authorization/cookie header values as-is instead of masked'),
+    saveTo: z.string().optional().describe('Absolute local path to save the full response body'),
+  },
+  tabs_list: {
+    group: z.string().optional().describe('Filter by group name'),
+  },
+  tab_create: {
+    url: z.string().optional().describe('URL to open, omitted opens about:blank'),
+    active: bool().optional().describe('Focus the new tab, default true'),
     group: z.string().min(1).max(40).optional()
-      .describe('list: filter by group name. create/group: group name, found or created in the tab\'s window. group without a name removes the tabs from their group'),
-    bypassCache: bool().optional().describe('reload: skip the cache'),
+      .describe('Group name, found or created in the tab\'s window'),
+  },
+  tab_close: {
+    tabIds: lenientNumberArray().describe('Target tabs'),
+  },
+  tab_activate: {
+    tabId: lenientTabId(),
+  },
+  tab_reload: {
+    tabId: lenientTabId(),
+    bypassCache: bool().optional().describe('Skip the cache'),
+  },
+  tab_duplicate: {
+    tabId: lenientTabId(),
+  },
+  tab_group: {
+    tabIds: lenientNumberArray().describe('Target tabs'),
+    group: z.string().min(1).max(40).optional().describe('Group name; omit to ungroup'),
   },
   wait_for: {
     tabId: lenientTabId(),
@@ -269,7 +315,10 @@ const SCHEMAS = {
 // ─── Tool descriptions ────────────────────────────────────────────────────────
 
 const DESCRIPTIONS = {
-  computer: 'Control the browser with mouse, keyboard, and screenshots. Use tabs (action list) first if you need a valid tabId. Screenshots are costly in tokens: prefer read_page/find with ref for locating and clicking, and use screenshot (or zoom on a region for detail) only when visual confirmation is needed.',
+  computer: 'Control the browser with mouse, keyboard, and screenshots. For most flows prefer: read_page → find → form_input → click via ref. Use computer only when you need drag, zoom, hover, or multi-step interactions.',
+  screenshot: 'Take a screenshot of the tab viewport. Images are costly in tokens: prefer read_page/find with ref for locating elements, and use screenshot only when visual confirmation is needed. Use saveTo to write to disk and keep context small.',
+  click: 'Click an element by ref (preferred) or by coordinate. Use read_page or find to get refs.',
+  sleep: 'Wait for a fixed number of seconds. Prefer wait_for with a condition over blind sleeps.',
   read_page: 'Get accessibility tree of the page. Use filter="interactive" for inputs/buttons only.',
   find: 'Find page elements by keyword. Use exact visible text (e.g. "Submit", "Add to cart").',
   form_input: 'Set a value on a form field (input, select, textarea, contenteditable) by ref.',
@@ -279,8 +328,15 @@ const DESCRIPTIONS = {
   file_upload: 'Upload local files to a page file input. Use ref for visible input[type=file], triggerRef for a button that opens the picker. Iframe refs (e.g. f3.ref_7) work for both.',
   resize_window: 'Resize the browser window.',
   read_console_messages: 'Read buffered browser console messages from a tab.',
-  network: 'Inspect HTTP network requests observed in a tab. Requests are only captured after the first network call on that tab attaches the debugger: requests made before that first call have no data. action "list" shows captured requests with their number (#N), method, status or failure reason, and URL; use urlPattern/method/status/failedOnly filters and clear to reset the buffer. action "detail" returns the request/response headers and bodies of one request chosen by seq (the #N from list); the response body is NOT included inline by default beyond bodyLimit characters and can be written to disk with saveTo (absolute path) instead of entering the context; authorization/cookie header values are masked unless rawHeaders:true. Binary bodies report size and MIME type only.',
-  tabs: 'Manage browser tabs and named tab groups. Actions: list (shows tab id, title, URL, window, group, and the active tab; optional group name filter), create (optional url; loads before returning; optional group name; active defaults to true — background tabs (active:false) get throttled by the browser, so keep active:true for pages where you need screenshots or animations), close (tabIds, batch), activate (tabId, also focuses its window), reload (tabId, optional bypassCache), duplicate (tabId), group (tabIds; group name is looked up or created in the window of the tabs; same-named groups in different windows are separate groups; omitting group ungroups the tabs). Group names are trimmed, 1-40 chars. Use tabs (action list) to discover tabIds.',
+  network_list: 'List captured network requests on a tab (only after the debugger is attached). Returns #N, method, status/failure, URL. Use filters to narrow; clear to reset buffer.',
+  network_detail: 'Get full request/response headers and body for one request from network_list. Response body is truncated at bodyLimit; use saveTo to write full body to disk. auth/cookie headers are masked unless rawHeaders:true.',
+  tabs_list: 'List all tabs with id, title, URL, window, group, and active marker. Use this to discover valid tabIds.',
+  tab_create: 'Open a new tab (optionally with URL and group). active defaults to true; background tabs get throttled. Returns tab id and URL.',
+  tab_close: 'Close one or more tabs by id.',
+  tab_activate: 'Focus a tab and its window.',
+  tab_reload: 'Reload a tab, optionally bypassing cache.',
+  tab_duplicate: 'Duplicate a tab.',
+  tab_group: 'Group tabs by name (creates the group if needed). Omit group to ungroup.',
   wait_for: 'Wait for an element to appear/disappear, URL change, network idle, or a fixed time. Prefer over blind sleeps after navigation.',
   handle_dialog: 'Answer a pending JS dialog (alert/confirm/prompt) left open by dialog:"manual".',
   save_pdf: 'Save the page as PDF to a local file via CDP printToPDF.',
@@ -288,7 +344,7 @@ const DESCRIPTIONS = {
   downloads: 'List downloads, wait for a download to complete and get its local path, or erase history entries.',
   performance: 'Inspect page performance. "metrics" returns an instant snapshot (LCP, CLS, INP, FCP, TTFB, JS heap, DOM nodes, listeners, slowest resources). "trace_start" then "trace_stop" records a Chrome trace and returns a summary (long tasks, blocking time, main-thread breakdown, heaviest scripts); use reload:true on trace_start to capture page load. Combine with emulate to test under throttling.',
   emulate: 'Emulate a device and environment on a tab (CDP): device presets (iphone-15, ipad-air, pixel-8) or custom width/height/deviceScaleFactor/mobile, geolocation, timezone, locale, CPU/network throttling, color scheme, user agent. Overrides stay until reset:true or the debugger detaches. Geolocation only reaches the page if the site already has location permission in Chrome; this tool cannot grant it.',
-  intercept_add: 'Intercept and mock network requests on a tab (CDP Fetch). Add a rule that matches requests by URL wildcard (and optionally method): fail aborts them with a network error, fulfill answers with a mock status/headers/body (text via body, binary via bodyBase64, up to 1 MB), delay holds them for delayMs. The first matching rule wins. Cross-origin mocks get access-control-allow-origin echoed and access-control-allow-credentials added, and CORS preflights are answered automatically. Rules last until intercept_remove, the tab closes, or the debugger detaches (DevTools opened); they survive extension restarts. Mocked requests still show up in network list as normal responses.',
+  intercept_add: 'Intercept and mock network requests on a tab (CDP Fetch). Add a rule that matches requests by URL wildcard (and optionally method): fail aborts them with a network error, fulfill answers with a mock status/headers/body (text via body, binary via bodyBase64, up to 1 MB), delay holds them for delayMs. The first matching rule wins. Cross-origin mocks get access-control-allow-origin echoed and access-control-allow-credentials added, and CORS preflights are answered automatically. Rules last until intercept_remove, the tab closes, or the debugger detaches (DevTools opened); they survive extension restarts. Mocked requests still show up in network_list as normal responses.',
   intercept_list: 'List the intercept rules on a tab with their hit counts and whether interception is currently active.',
   intercept_remove: 'Remove one intercept rule by id, or all rules on the tab (omit ruleId), which also turns interception off.',
   storage: 'Read and write localStorage / sessionStorage of the tab\'s main frame, or summarize IndexedDB. Actions: list (keys with size and a short preview), get (one value, truncated at maxChars), set / remove / clear (writes), idb (read-only summary of databases, object stores and record counts; record contents are never read). Works on the top-level frame\'s origin only, not on iframes; the first line of every result shows the origin. Values are not masked, treat them like cookies.',
@@ -305,10 +361,12 @@ const QUEUE_WAIT_MS = 30000;
 
 /** 基础超时（不含排队等待），工具自身的执行时间预算 */
 const BASE_TIMEOUTS = {
-  computer: 30000, form_input: 15000, navigate: 30000,
+  computer: 30000, screenshot: 15000, click: 15000, sleep: 12000,
+  form_input: 15000, navigate: 30000,
   file_upload: 30000, javascript_tool: 30000,
-  tabs: 40000, // 含 create 的页面加载等待
-  network: 15000,
+  network_list: 10000, network_detail: 15000,
+  tabs_list: 5000, tab_create: 40000, tab_close: 10000,
+  tab_activate: 5000, tab_reload: 20000, tab_duplicate: 20000, tab_group: 10000,
   find: 15000, read_page: 15000, get_page_text: 15000,
   resize_window: 10000, read_console_messages: 10000,
   wait_for: 130000, handle_dialog: 5000, save_pdf: 60000,
@@ -318,7 +376,7 @@ const BASE_TIMEOUTS = {
 };
 
 /** 会进扩展侧串行队列的工具；其超时叠加排队等待，避免排队期间被 relay 判超时 */
-const QUEUED_TOOLS = new Set(['computer', 'form_input', 'navigate', 'file_upload', 'javascript_tool', 'tabs', 'storage']);
+const QUEUED_TOOLS = new Set(['computer', 'click', 'form_input', 'navigate', 'file_upload', 'javascript_tool', 'tab_reload', 'storage']);
 
 /** 最终生效的超时表 = 基础表 + 排队工具的 QUEUE_WAIT_MS */
 export const TOOL_TIMEOUTS = Object.fromEntries(
@@ -327,6 +385,16 @@ export const TOOL_TIMEOUTS = Object.fromEntries(
 
 // ─── Build a fresh McpServer with all tools registered ──────────────────────────
 
+// raw shape 表达不了的跨字段校验集中在这里：key -> (args) => 错误消息 | null。
+// 校验在 handler 内做（SDK 的 tool() 只收 raw shape，收不了带 refine 的 ZodObject），
+// 返回 isError 文本与 zod 校验失败的形态一致，模型可直接自纠错。
+const SHAPE_REFINEMENTS = {
+  // ref 与 coordinate 都 optional，必须至少给一个
+  click: (v) => (v.ref || v.coordinate
+    ? null
+    : 'Provide ref (preferred, from read_page or find) or coordinate [x, y]'),
+};
+
 export function buildMcpServer() {
   const server = new McpServer({
     name: 'browser-mcp',
@@ -334,7 +402,17 @@ export function buildMcpServer() {
   });
 
   for (const [name, schema] of Object.entries(SCHEMAS)) {
-    server.tool(name, DESCRIPTIONS[name], schema, async (args) => relay(name, args));
+    const refine = SHAPE_REFINEMENTS[name];
+    server.tool(name, DESCRIPTIONS[name], schema, async (args) => {
+      const refineMsg = refine?.(args);
+      if (refineMsg) {
+        return {
+          content: [{ type: 'text', text: `Error [VALIDATION_ERROR]: ${refineMsg}` }],
+          isError: true,
+        };
+      }
+      return relay(name, args);
+    });
   }
 
   return server;
@@ -355,7 +433,7 @@ function formatSize(n) {
     : n >= 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} B`;
 }
 
-// x-file：扩展与 relay 之间的私有内容项（如 network detail 的完整响应体），
+// x-file：扩展与 relay 之间的私有内容项（如 network_detail 的完整响应体），
 // 仅用于落盘通道，绝不能以原样到达 MCP 客户端。
 const X_FILE_TYPE = 'x-file';
 
@@ -498,7 +576,7 @@ async function relay(tool, args) {
 export function startMcpServer(port = 3000) {
   const app = express();
   // intercept_add 的 bodyBase64 上限 1 MB（解码后），base64 后约 1.4 MB，再经 JSON 包装需留余量；
-  // 默认 100 KB 会让大二进制 Mock 直接 413。network detail 的响应体也走同一通道。
+  // 默认 100 KB 会让大二进制 Mock 直接 413。network_detail 的响应体也走同一通道。
   app.use(express.json({ limit: '8mb' }));
 
   // Status endpoint

@@ -37,17 +37,23 @@ test('公布的 schema 对数字/布尔/数组同时放行字符串形式', asyn
   }
 });
 
-test('工具清单恰好 23 个，旧工具已删除，新工具已就位', async () => {
+test('工具清单恰好 33 个，旧工具已删除，新工具已就位', async () => {
   const client = await connectClient();
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name);
-  assert.equal(names.length, 23);
-  for (const old of ['tabs_context', 'tabs_create', 'tabs_close', 'read_network_requests']) {
+  assert.equal(names.length, 33);
+  for (const old of ['tabs_context', 'tabs_create', 'tabs_close', 'read_network_requests', 'tabs', 'network']) {
     assert.ok(!names.includes(old), `${old} 应被删除`);
   }
-  assert.ok(names.includes('tabs'));
-  assert.ok(names.includes('network'));
-  assert.ok(names.includes('storage'));
+  for (const name of [
+    'network_list', 'network_detail',
+    'tabs_list', 'tab_create', 'tab_close', 'tab_activate',
+    'tab_reload', 'tab_duplicate', 'tab_group',
+    'screenshot', 'click', 'sleep',
+    'storage',
+  ]) {
+    assert.ok(names.includes(name), `${name} 应存在`);
+  }
   for (const name of ['intercept_add', 'intercept_list', 'intercept_remove']) {
     assert.ok(names.includes(name), `${name} 应存在`);
   }
@@ -86,10 +92,10 @@ test('intercept_add 拒绝越界的 delayMs 和未知 errorReason', async () => 
   assert.equal(badReason.isError, true);
 });
 
-test('tabs 的 tabIds 公布 anyOf，客户端预校验可放行字符串形式', async () => {
+test('tab_close 的 tabIds 公布 anyOf，客户端预校验可放行字符串形式', async () => {
   const client = await connectClient();
   const { tools } = await client.listTools();
-  const tabIds = tools.find((t) => t.name === 'tabs').inputSchema.properties.tabIds;
+  const tabIds = tools.find((t) => t.name === 'tab_close').inputSchema.properties.tabIds;
   assert.ok(tabIds.anyOf, `tabIds 应为 anyOf: ${JSON.stringify(tabIds)}`);
   assert.ok(tabIds.anyOf.some((s) => s.type === 'string'), 'tabIds 缺少 string 分支');
 });
@@ -133,32 +139,32 @@ test('原生类型参数保持不变', async () => {
   setExtensionWs(fakeWs);
   received.length = 0;
   const client = await connectClient();
-  await client.callTool({ name: 'tabs', arguments: { action: 'close', tabIds: [5] } });
-  assert.deepEqual(received[0].arguments, { action: 'close', tabIds: [5] });
+  await client.callTool({ name: 'tab_close', arguments: { tabIds: [5] } });
+  assert.deepEqual(received[0].arguments, { tabIds: [5] });
 });
 
-test('tabs 的 tabIds 字符串形式还原为数字数组', async () => {
+test('tab_close 的 tabIds 字符串形式还原为数字数组', async () => {
   setExtensionWs(fakeWs);
   received.length = 0;
   const client = await connectClient();
   const res = await client.callTool({
-    name: 'tabs', arguments: { action: 'close', tabIds: '[5]' },
+    name: 'tab_close', arguments: { tabIds: '[5]' },
   });
   assert.notEqual(res.isError, true, JSON.stringify(res));
-  assert.deepEqual(received[0].arguments, { action: 'close', tabIds: [5] });
+  assert.deepEqual(received[0].arguments, { tabIds: [5] });
 });
 
-test('network 的字符串数字与布尔还原为原生类型', async () => {
+test('network_list/network_detail 的字符串数字与布尔还原为原生类型', async () => {
   setExtensionWs(fakeWs);
   received.length = 0;
   const client = await connectClient();
   await client.callTool({
-    name: 'network',
+    name: 'network_list',
     arguments: {
-      action: 'list', tabId: '5', failedOnly: 'true', limit: '20', clear: 'false',
+      tabId: '5', failedOnly: 'true', limit: '20', clear: 'false',
     },
   });
-  assert.equal(received[0].tool, 'network');
+  assert.equal(received[0].tool, 'network_list');
   assert.equal(received[0].arguments.tabId, 5);
   assert.equal(received[0].arguments.failedOnly, true);
   assert.equal(received[0].arguments.limit, 20);
@@ -166,11 +172,12 @@ test('network 的字符串数字与布尔还原为原生类型', async () => {
 
   received.length = 0;
   await client.callTool({
-    name: 'network',
+    name: 'network_detail',
     arguments: {
-      action: 'detail', tabId: '5', seq: '7', bodyLimit: '3000', rawHeaders: 'true',
+      tabId: '5', seq: '7', bodyLimit: '3000', rawHeaders: 'true',
     },
   });
+  assert.equal(received[0].tool, 'network_detail');
   assert.equal(received[0].arguments.seq, 7);
   assert.equal(received[0].arguments.bodyLimit, 3000);
   assert.equal(received[0].arguments.rawHeaders, true);
@@ -190,7 +197,7 @@ test('非法字符串被拒绝', async () => {
   setExtensionWs(fakeWs);
   const client = await connectClient();
   const res = await client.callTool({
-    name: 'tabs', arguments: { action: 'close', tabIds: ['abc'] },
+    name: 'tab_close', arguments: { tabIds: ['abc'] },
   });
   assert.equal(res.isError, true);
 });
@@ -318,7 +325,7 @@ test('intercept_add 的 bodyBase64 透传给扩展', async () => {
 
 // ── 错误消息自纠错：三类高频调用错误必须带可执行的指引 ────────────────────────
 
-test('tabId 传 UUID 时校验错误附 tabs list 指引', async () => {
+test('tabId 传 UUID 时校验错误附 tabs_list 指引', async () => {
   setExtensionWs(fakeWs);
   const client = await connectClient();
   const res = await client.callTool({
@@ -327,8 +334,7 @@ test('tabId 传 UUID 时校验错误附 tabs list 指引', async () => {
   assert.equal(res.isError, true);
   const text = res.content[0].text;
   assert.match(text, /numeric Chrome tab id/);
-  // 文本经 JSON 转义，引号形如 \"list\"，不做精确引号匹配
-  assert.match(text, /tabs \(action/);
+  assert.match(text, /tabs_list/);
   assert.match(text, /tabId/);
 });
 
@@ -364,18 +370,107 @@ test('computer 支持的动作不受 errorMap 影响', async () => {
   assert.equal(received[0].arguments.tabId, 5);
 });
 
+// ── D 批：computer 拆出的 screenshot / click / sleep 顶层工具 ────────────────
+
+test('screenshot 的字符串参数还原为原生类型后下发', async () => {
+  setExtensionWs(fakeWs);
+  received.length = 0;
+  const client = await connectClient();
+  const res = await client.callTool({
+    name: 'screenshot',
+    arguments: { tabId: '7', maxDimension: '900', fullPage: 'false', quality: '80' },
+  });
+  assert.notEqual(res.isError, true, JSON.stringify(res));
+  assert.equal(received[0].tool, 'screenshot');
+  assert.equal(received[0].arguments.tabId, 7);
+  assert.equal(received[0].arguments.maxDimension, 900);
+  assert.equal(received[0].arguments.fullPage, false);
+  assert.equal(received[0].arguments.quality, 80);
+});
+
+test('screenshot 越界 maxDimension 被拒绝', async () => {
+  setExtensionWs(fakeWs);
+  const client = await connectClient();
+  const res = await client.callTool({
+    name: 'screenshot', arguments: { tabId: 1, maxDimension: 100 },
+  });
+  assert.equal(res.isError, true);
+});
+
+test('click 的 ref 优先路径与默认值下发', async () => {
+  setExtensionWs(fakeWs);
+  received.length = 0;
+  const client = await connectClient();
+  const res = await client.callTool({
+    name: 'click', arguments: { tabId: '7', ref: 'ref_12' },
+  });
+  assert.notEqual(res.isError, true, JSON.stringify(res));
+  assert.equal(received[0].tool, 'click');
+  // 未传的 button/double/triple 由 schema default 填充
+  assert.deepEqual(received[0].arguments, { tabId: 7, ref: 'ref_12', button: 'left', double: false, triple: false });
+});
+
+test('click 的字符串 coordinate 与 double=true 还原为原生类型', async () => {
+  setExtensionWs(fakeWs);
+  received.length = 0;
+  const client = await connectClient();
+  const res = await client.callTool({
+    name: 'click',
+    arguments: { tabId: 7, coordinate: '[601, 385]', double: 'true', button: 'right' },
+  });
+  assert.notEqual(res.isError, true, JSON.stringify(res));
+  assert.deepEqual(received[0].arguments, { tabId: 7, coordinate: [601, 385], double: true, triple: false, button: 'right' });
+});
+
+test('click 缺 ref 与 coordinate 时被拒绝', async () => {
+  setExtensionWs(fakeWs);
+  const client = await connectClient();
+  const res = await client.callTool({ name: 'click', arguments: { tabId: 1 } });
+  assert.equal(res.isError, true);
+});
+
+test('sleep 的字符串秒数还原为原生类型，越界被拒绝', async () => {
+  setExtensionWs(fakeWs);
+  received.length = 0;
+  const client = await connectClient();
+  const res = await client.callTool({ name: 'sleep', arguments: { tabId: '7', seconds: '2' } });
+  assert.notEqual(res.isError, true, JSON.stringify(res));
+  assert.equal(received[0].tool, 'sleep');
+  assert.deepEqual(received[0].arguments, { tabId: 7, seconds: 2 });
+
+  const bad = await client.callTool({ name: 'sleep', arguments: { tabId: 7, seconds: 11 } });
+  assert.equal(bad.isError, true);
+});
+
+test('computer 的新拆分工具名传入 action 时给出正确指引', async () => {
+  setExtensionWs(fakeWs);
+  const client = await connectClient();
+  for (const [action, hint] of [
+    ['click', /click tool/],
+    ['sleep', /sleep tool/],
+  ]) {
+    const res = await client.callTool({
+      name: 'computer', arguments: { action, tabId: 1 },
+    });
+    assert.equal(res.isError, true, `${action} 应被拒绝`);
+    const text = res.content[0].text;
+    assert.match(text, new RegExp(`computer does not support action.{0,3}${action}`));
+    assert.match(text, hint);
+  }
+});
+
 test('所有带必填 tabId 的工具公布 tabId 指引描述', async () => {
   const client = await connectClient();
   const { tools } = await client.listTools();
-  // tabs 的 tabId 是可选参数（仅 activate/reload/duplicate 用），描述另论
-  const withTabId = tools.filter((t) => t.name !== 'tabs' && t.inputSchema.properties?.tabId);
+  const withTabId = tools.filter((t) => t.inputSchema.properties?.tabId);
+  // network_list/network_detail 与 7 个 tab 工具里 3 个带 tabId 的都算上
   assert.ok(withTabId.length >= 19, `应有 ≥19 个带必填 tabId 的工具，实际 ${withTabId.length}`);
   for (const t of withTabId) {
     // 校验 description 字段本身（JSON.stringify 会把引号转义，不能对整体字符串 includes）
     const desc = t.inputSchema.properties.tabId.description || '';
     assert.ok(
-      desc.includes('tabs (action: "list")'),
-      `${t.name} 的 tabId 描述应包含 tabs list 指引: ${desc.slice(0, 120)}`,
+      desc.includes('tabs_list'),
+      `${t.name} 的 tabId 描述应包含 tabs_list 指引: ${desc.slice(0, 120)}`,
     );
   }
 });

@@ -1,6 +1,7 @@
-// tabs 工具的胶水实现：七个 action（list/create/close/activate/reload/duplicate/group）。
+// tabs 工具族：七个原子工具（tabs_list/tab_create/tab_close/tab_activate/tab_reload/tab_duplicate/tab_group），
+// 由原先按 action 分派的单一 tabs 工具拆分而来。ACTIONS 保留参数校验职责。
 // 所有依赖（chrome、ok、err、waitForLoad、sleep）通过参数注入，避免与 background.js 循环引用。
-// 按 action 的必填参数校验在本文件，缺参数时返回明确文案（relay 的 zod schema 是扁平的）。
+// 各工具的必填参数校验在本文件，缺参数时返回明确文案（relay 的 zod schema 是扁平的）。
 
 import { normalizeUrl } from '../lib/url.js';
 import {
@@ -165,6 +166,7 @@ export function createTabsTool({ chrome, ok, err, waitForLoad, sleep }) {
       : `Created group "${name}" (color ${groupColor(name)}, window ${windowId}) with ${tabIds.length} tab(s)` }]);
   }
 
+  // 各工具的参数校验（从原 ACTIONS 映射拆分而来）与 chrome 异常兜底
   const ACTIONS = {
     list: [actionList, () => true],
     create: [actionCreate, args => args.url === undefined || typeof args.url === 'string'],
@@ -175,15 +177,25 @@ export function createTabsTool({ chrome, ok, err, waitForLoad, sleep }) {
     group: [actionGroup, args => Array.isArray(args.tabIds) && args.tabIds.length > 0, 'group requires tabIds'],
   };
 
-  return async function toolTabs(args) {
-    const spec = ACTIONS[args.action];
-    if (!spec) return err(`Unknown action: ${args.action}`);
-    const [handler, validate, message] = spec;
-    if (!validate(args)) return err(message || 'invalid arguments');
-    try {
-      return await handler(args);
-    } catch (e) {
-      return err(e.message);
-    }
+  function makeTool(actionName) {
+    const [handler, validate, message] = ACTIONS[actionName];
+    return async function (args) {
+      if (!validate(args)) return err(message || 'invalid arguments');
+      try {
+        return await handler(args);
+      } catch (e) {
+        return err(e.message);
+      }
+    };
+  }
+
+  return {
+    toolTabsList: makeTool('list'),
+    toolTabCreate: makeTool('create'),
+    toolTabClose: makeTool('close'),
+    toolTabActivate: makeTool('activate'),
+    toolTabReload: makeTool('reload'),
+    toolTabDuplicate: makeTool('duplicate'),
+    toolTabGroup: makeTool('group'),
   };
 }

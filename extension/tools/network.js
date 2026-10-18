@@ -1,4 +1,4 @@
-// network 工具的胶水实现：list（过滤、失败原因）与 detail（头、请求体、响应体）。
+// network 工具的胶水实现：network_list（过滤、失败原因）与 network_detail（头、请求体、响应体）。
 // 依赖（chrome、ok、err、ensureCdp、tabBuf）通过参数注入，避免与 background.js 循环引用。
 // 响应体不缓存，detail 时才向浏览器取；超长文本截断，二进制不回传，saveTo 时经 x-file 内容项交给 relay 落盘。
 
@@ -51,7 +51,6 @@ export function createNetworkTool({ chrome, ok, err, ensureCdp, tabBuf }) {
     }
     return ok([{ type: 'text', text }]);
   }
-
   async function requestSection(tabId, entry, bodyLimit) {
     if (!entry.hasPostData) return '';
     let data = entry.postData;
@@ -104,7 +103,6 @@ export function createNetworkTool({ chrome, ok, err, ensureCdp, tabBuf }) {
   }
 
   async function actionDetail(args) {
-    if (!Number.isInteger(args.seq)) return err('detail requires seq (the #number shown by list)');
     const store = tabBuf(args.tabId).network;
     const entry = store.get(args.seq);
     if (entry === 'evicted') return err(`Request #${args.seq} was evicted from the buffer; only the most recent 1000 requests are kept`);
@@ -119,11 +117,29 @@ export function createNetworkTool({ chrome, ok, err, ensureCdp, tabBuf }) {
     return ok(content);
   }
 
-  return async function toolNetwork(args) {
-    const { action, tabId } = args;
-    if (!Number.isInteger(tabId)) return err('tabId required');
-    if (action !== 'list' && action !== 'detail') return err(`Unknown action: ${action}`);
-    await ensureCdp(tabId);
-    return action === 'list' ? actionList(args) : actionDetail(args);
-  };
+  // 两个工具共用 ensureCdp 校验路径：tabId 缺失或非法时返回统一文案
+  async function requireCdp(args) {
+    if (!Number.isInteger(args.tabId)) return err('tabId required');
+    try {
+      await ensureCdp(args.tabId);
+      return null;
+    } catch (e) {
+      return err(e.message);
+    }
+  }
+
+  async function toolNetworkList(args) {
+    const bad = await requireCdp(args);
+    if (bad) return bad;
+    return actionList(args);
+  }
+
+  async function toolNetworkDetail(args) {
+    if (!Number.isInteger(args.seq)) return err('seq required (the #number shown by network_list)');
+    const bad = await requireCdp(args);
+    if (bad) return bad;
+    return actionDetail(args);
+  }
+
+  return { toolNetworkList, toolNetworkDetail };
 }

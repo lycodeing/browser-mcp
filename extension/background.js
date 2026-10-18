@@ -13,6 +13,7 @@ import { createStorageTool } from './tools/storage.js';
 import { createInterceptStore } from './lib/intercept.js';
 import { createInterceptTools } from './tools/intercept.js';
 import { createPageTools } from './tools/page-tools.js';
+import { createComputerTools } from './tools/computer-tools.js';
 import {
   parseRef, mergeFrameTrees, mergeFindResults, formatFindLines, resolveFrameOffset, toTopPoint,
 } from './lib/frames.js';
@@ -110,9 +111,9 @@ async function cdpAttach(tabId) {
   throw new Error(
     `CDP attach failed after ${ATTACH_RETRY_DELAYS.length + 1} attempts `
     + `(tab ${tabId}, ${tab?.url || 'unknown url'}, status ${tab?.status || 'unknown'}): ${lastErr?.message}. `
-    + 'Tools that need the debugger (computer, javascript_tool, read_console_messages, network) are unavailable on this tab right now; '
+    + 'Tools that need the debugger (computer, javascript_tool, read_console_messages, network_list) are unavailable on this tab right now; '
     + 'read_page, find, form_input and get_page_text do not use it and still work. '
-    + 'Do not resend the identical call: wait a few seconds, open a fresh tab via tabs (action create), or navigate again.'
+    + 'Do not resend the identical call: wait a few seconds, open a fresh tab via tab_create, or navigate again.'
   );
 }
 
@@ -362,6 +363,9 @@ async function getElemCoords(tabId, refStr) {
   return { x: Math.round(x), y: Math.round(y) };
 }
 
+// computer 与 click 工具共用的实现（坐标解析 / CDP 点击序列 / 截图）在 tools/computer-tools.js，
+// 依赖注入自这里；顶层 screenshot / click / sleep 工具也在那边注册实现。
+
 async function toolComputer(args) {
   const {action, tabId} = args;
   if (!tabId) return err('tabId is required');
@@ -379,16 +383,7 @@ async function toolComputer(args) {
 async function computerDispatch(args, tabId, action) {
   switch(action) {
     case 'screenshot': {
-      await sleep(50);
-      const { data, width, height, format, fullPage, scale } = await captureScreenshot(tabId, {
-        quality: args.quality, format: args.format,
-        fullPage: args.fullPage, maxDimension: args.maxDimension,
-      });
-      // 全页截图的坐标无法对应视口点击，不更新换算比例
-      if (!fullPage) shotScale.set(tabId, scale);
-      const note = !fullPage && scale < 1
-        ? ` (page scaled ${scale.toFixed(2)}x; pass coordinates in this image's pixels)` : '';
-      return ok([{type:'text',text:`Screenshot ${width}x${height}${note}`},{type:'image',data,mimeType:`image/${format}`}]);
+      return takeScreenshot(tabId, args);
     }
     case 'wait': {
       await sleep(Math.min((args.duration||1),10)*1000);
@@ -495,23 +490,13 @@ async function computerDispatch(args, tabId, action) {
       return ok([{type:'text',text:`Dragged (${osx},${osy})→(${oex},${oey})`}]);
     }
     default: { // left_click, right_click, double_click, triple_click
-      let x,y;
-      if (args.ref) {
-        await ensureCs(tabId);
-        const c = await getElemCoords(tabId,args.ref);
-        if (!c) return err(refNotFound(args.ref));
-        x=c.x; y=c.y;
-      } else if (args.coordinate) {[x,y]=toCss(tabId,args.coordinate);} else return err('coordinate or ref required');
+      const pt = await resolveClickPoint(args, tabId);
+      if (pt.error) return pt.error;
       const btn = action==='right_click'?'right':'left';
       const cnt = action==='double_click'?2:action==='triple_click'?3:1;
       const mods = parseMods(args.modifiers);
-      await chrome.debugger.sendCommand({tabId},'Input.dispatchMouseEvent',{type:'mouseMoved',x,y,modifiers:mods});
-      await sleep(50);
-      await chrome.debugger.sendCommand({tabId},'Input.dispatchMouseEvent',{type:'mousePressed',x,y,button:btn,clickCount:cnt,modifiers:mods});
-      await sleep(50);
-      await chrome.debugger.sendCommand({tabId},'Input.dispatchMouseEvent',{type:'mouseReleased',x,y,button:btn,clickCount:cnt,modifiers:mods});
-      if (btn==='right') await sleep(300);
-      const [lx,ly] = args.coordinate || [x,y];
+      await dispatchClick(tabId, { x: pt.x, y: pt.y, button: btn, clickCount: cnt, modifiers: mods });
+      const [lx,ly] = args.coordinate || [pt.x, pt.y];
       return ok([{type:'text',text:`${action} at (${Math.round(lx)},${Math.round(ly)})`}]);
     }
   }
@@ -696,8 +681,11 @@ async function toolReadConsole(args) {
   return ok([{type:'text',text:`Console (${msgs.length}${clear?', cleared':''}):\n\n${lines.join('\n')}`}]);
 }
 
-const toolTabs = createTabsTool({ chrome, ok, err, waitForLoad, sleep });
-const toolNetwork = createNetworkTool({ chrome, ok, err, ensureCdp, tabBuf });
+const {
+  toolTabsList, toolTabCreate, toolTabClose, toolTabActivate,
+  toolTabReload, toolTabDuplicate, toolTabGroup,
+} = createTabsTool({ chrome, ok, err, waitForLoad, sleep });
+const { toolNetworkList, toolNetworkDetail } = createNetworkTool({ chrome, ok, err, ensureCdp, tabBuf });
 const toolStorage = createStorageTool({ chrome, ok, err });
 const interceptStore = createInterceptStore();
 const intercept = createInterceptTools({
@@ -1078,14 +1066,28 @@ const { toolJavascript, toolGetPageText, toolFileUpload } = createPageTools({
   chrome, ok, err, ensureCdp, ensureCs, runInRefFrame, getElemCoords, sleep, frameContexts,
 });
 
+// computer 拆出的顶层工具；resolveClickPoint / dispatchClick / takeScreenshot 同时供 computer 复用
+const {
+  toolScreenshot, toolClick, toolSleep,
+  resolveClickPoint, dispatchClick, takeScreenshot,
+} = createComputerTools({
+  chrome, ok, err, ensureCdp, ensureCs, getElemCoords, refNotFound, toCss,
+  captureScreenshot, shotScale, setDialogMode, clearDialogMode, appendDialogNotes, sleep,
+});
+
 const TOOL_MAP = {
   performance: toolPerformance, emulate: toolEmulate,
   computer: toolComputer, read_page: toolReadPage, find: toolFind,
+  screenshot: toolScreenshot, click: toolClick, sleep: toolSleep,
   form_input: toolFormInput, navigate: toolNavigate,
   javascript_tool: toolJavascript, get_page_text: toolGetPageText,
   file_upload: toolFileUpload, resize_window: toolResizeWindow,
-  read_console_messages: toolReadConsole, network: toolNetwork,
-  tabs: toolTabs, storage: toolStorage,
+  read_console_messages: toolReadConsole,
+  network_list: toolNetworkList, network_detail: toolNetworkDetail,
+  tabs_list: toolTabsList, tab_create: toolTabCreate, tab_close: toolTabClose,
+  tab_activate: toolTabActivate, tab_reload: toolTabReload,
+  tab_duplicate: toolTabDuplicate, tab_group: toolTabGroup,
+  storage: toolStorage,
   intercept_add: intercept.intercept_add, intercept_list: intercept.intercept_list, intercept_remove: intercept.intercept_remove,
   wait_for: toolWaitFor, handle_dialog: toolHandleDialog, save_pdf: toolSavePdf,
   cookies: toolCookies, downloads: toolDownloads,
@@ -1099,15 +1101,16 @@ function ok(content) { return { content }; }
 function err(msg) { return { content:[{type:'text',text:`Error: ${msg}`}], isError:true }; }
 
 // 同一标签页的写操作串行执行；读操作与 handle_dialog 不排队（manual 弹窗会卡住持锁的点击）
+// click 是拆出的顶层写工具，与 computer 的点击 action 同级排队
 const QUEUED_ACTIONS = new Set(['left_click','right_click','double_click','triple_click',
-  'type','key','scroll','scroll_to','left_click_drag','hover']);
-const QUEUED_TOOLS = new Set(['form_input','navigate','file_upload','javascript_tool']);
-const STORAGE_WRITE_ACTIONS = new Set(['set','remove','clear']);
+  'type','key','scroll','scroll_to','left_click_drag','hover','click']);
+const QUEUED_TOOLS = new Set(['form_input', 'navigate', 'file_upload', 'javascript_tool', 'tab_reload']);
+const STORAGE_WRITE_ACTIONS = new Set(['set', 'remove', 'clear']);
 
 function isQueuedCall(tool, args) {
   if (!Number.isInteger(args?.tabId)) return false;
   if (tool === 'computer') return QUEUED_ACTIONS.has(args.action);
-  if (tool === 'tabs') return args.action === 'reload';
+  if (tool === 'click') return true;
   if (tool === 'storage') return STORAGE_WRITE_ACTIONS.has(args.action);
   return QUEUED_TOOLS.has(tool);
 }

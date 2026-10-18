@@ -27,7 +27,7 @@ async function callNetwork(args) {
   const client = new Client({ name: 'test', version: '0' });
   await client.connect(ct);
   setExtensionWs(fakeWs);
-  return client.callTool({ name: 'network', arguments: args });
+  return client.callTool({ name: 'network_detail', arguments: args });
 }
 
 // 每个 case 用独立的临时目录，测完清理
@@ -41,7 +41,7 @@ test('带 saveTo 的 x-file 落盘并替换为路径文本', async () => {
       { type: 'text', text: '#7 GET https://example.com/x → 200' },
       { type: 'x-file', data: bodyBase64 },
     ];
-    const res = await callNetwork({ action: 'detail', tabId: 1, seq: 7, saveTo: path.join(dir, 'body.txt') });
+    const res = await callNetwork({ tabId: 1, seq: 7, saveTo: path.join(dir, 'body.txt') });
     assert.notEqual(res.isError, true, JSON.stringify(res));
     assert.equal(res.content.some((c) => c.type === 'x-file'), false);
     const saved = res.content.find((c) => c.type === 'text' && c.text.includes('Saved to'));
@@ -60,7 +60,7 @@ test('不带 saveTo 时残留的 x-file 被剔除，不泄漏给客户端', asyn
     { type: 'text', text: '#7 GET https://example.com/x → 200' },
     { type: 'x-file', data: bodyBase64 },
   ];
-  const res = await callNetwork({ action: 'detail', tabId: 1, seq: 7 });
+  const res = await callNetwork({ tabId: 1, seq: 7 });
   replyContent = null;
   assert.notEqual(res.isError, true, JSON.stringify(res));
   assert.deepEqual(
@@ -75,7 +75,7 @@ test('saveTo 为相对路径时返回错误且不泄漏 x-file', async () => {
     { type: 'text', text: 'detail' },
     { type: 'x-file', data: bodyBase64 },
   ];
-  const res = await callNetwork({ action: 'detail', tabId: 1, seq: 7, saveTo: 'relative/body.txt' });
+  const res = await callNetwork({ tabId: 1, seq: 7, saveTo: 'relative/body.txt' });
   replyContent = null;
   assert.equal(res.isError, true);
   assert.equal(res.content.some((c) => c.type === 'x-file'), false);
@@ -93,7 +93,7 @@ test('写盘失败（saveTo 指向目录内的不可写路径）返回 isError �
     replyContent = [
       { type: 'x-file', data: bodyBase64 },
     ];
-    const res = await callNetwork({ action: 'detail', tabId: 1, seq: 7, saveTo: path.join(dir, 'out.txt') });
+    const res = await callNetwork({ tabId: 1, seq: 7, saveTo: path.join(dir, 'out.txt') });
     replyContent = null;
     assert.equal(res.isError, true);
     assert.equal(res.content.some((c) => c.type === 'x-file'), false);
