@@ -27,6 +27,8 @@
 
 ### 修复
 - relay 现在能应答扩展主动发起的 `flow/list` / `flow/load` 请求（popup 与 MCP 工具拉流程数据的通道）
+- 录制激活失败：`chrome.runtime.sendMessage` 从 Service Worker 发不到自身，改用 `chrome.tabs.sendMessage(tabId, msg, {frameId})` 激活 content script 的 recorder
+- 回放报 `Flow has no steps`：relay 的 `flow/load` 应答从 `{flow: ...}` 改为直接返回 flow 本体，与扩展侧 `flow.steps` 的访问路径对齐
 
 ## [2.3.0] — 2026-10-18
 
