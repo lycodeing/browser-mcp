@@ -52,7 +52,8 @@ function normalizeLocale(locale) {
 }
 
 /**
- * 把 emulate 入参整理成执行计划，不碰浏览器。出错时返回 { error }，调用方应在附加调试器之前报错。
+ * 把 emulate 族入参整理成执行计划，不碰浏览器。出错时返回 { error }，调用方应在附加调试器之前报错。
+ * 三个工具（emulate_device / emulate_network / emulate_geo）共用这一份规划逻辑，各自只消费自己的计划字段。
  * 计划字段（未传的不出现）：cpu、network、scheme、viewport、touch、ua、timezone、locale、geo。
  * ua 的 platform / userAgentMetadata 只来自设备预设；显式 userAgent 只替换 UA 字符串本身。
  */
@@ -70,6 +71,7 @@ export function planEmulation(args) {
 
   if (cpuThrottlingRate != null) plan.cpu = cpuThrottlingRate;
   if (networkConditions != null) plan.network = networkConditions;
+  // colorScheme 保留解析能力，但三个拆分后的工具均不再暴露该参数，也不再下发覆盖
   if (colorScheme != null) plan.scheme = colorScheme;
 
   if (preset || width != null || height != null || deviceScaleFactor != null || mobile != null) {

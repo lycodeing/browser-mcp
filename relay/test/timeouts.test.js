@@ -4,6 +4,8 @@ import { TOOL_TIMEOUTS } from '../src/mcp-server.js';
 
 test('排队工具的超时 = 基础值 + 30 秒排队等待', () => {
   assert.equal(TOOL_TIMEOUTS.form_input, 45000);
+  // form_input_multi 最多 20 个字段，基础值 30000 叠加排队后 60000
+  assert.equal(TOOL_TIMEOUTS.form_input_multi, 60000);
   assert.equal(TOOL_TIMEOUTS.computer, 60000);
   assert.equal(TOOL_TIMEOUTS.navigate, 60000);
   assert.equal(TOOL_TIMEOUTS.file_upload, 60000);
@@ -34,18 +36,21 @@ test('非排队工具的超时不受排队等待影响', () => {
   assert.equal(TOOL_TIMEOUTS.handle_dialog, 5000);
   assert.equal(TOOL_TIMEOUTS.save_pdf, 60000);
   assert.equal(TOOL_TIMEOUTS.performance, 60000);
-  assert.equal(TOOL_TIMEOUTS.emulate, 10000);
+  // emulate 拆成三个工具后，各自保持原 10 秒基础超时
+  assert.equal(TOOL_TIMEOUTS.emulate_device, 10000);
+  assert.equal(TOOL_TIMEOUTS.emulate_network, 10000);
+  assert.equal(TOOL_TIMEOUTS.emulate_geo, 10000);
   // state 是轻量只读快照，不排队
   assert.equal(TOOL_TIMEOUTS.state, 5000);
 });
 
 test('超时表覆盖全部工具且不含旧工具名', () => {
   const names = Object.keys(TOOL_TIMEOUTS).sort();
-  assert.equal(names.length, 34);
-  for (const old of ['tabs_context', 'tabs_create', 'tabs_close', 'read_network_requests', 'tabs', 'network']) {
+  assert.equal(names.length, 37);
+  for (const old of ['tabs_context', 'tabs_create', 'tabs_close', 'read_network_requests', 'tabs', 'network', 'emulate']) {
     assert.ok(!names.includes(old), `${old} 应被删除`);
   }
-  for (const name of ['screenshot', 'click', 'sleep']) {
+  for (const name of ['screenshot', 'click', 'sleep', 'form_input_multi', 'emulate_device', 'emulate_network', 'emulate_geo']) {
     assert.ok(names.includes(name), `${name} 应存在`);
   }
   for (const name of ['intercept_add', 'intercept_list', 'intercept_remove']) {

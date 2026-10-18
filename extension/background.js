@@ -8,7 +8,7 @@ import { createTabsTool } from './tools/tabs.js';
 import { tabNotFoundMessage } from './lib/tabs.js';
 import { createNetworkStore } from './lib/network.js';
 import { createNetworkTool } from './tools/network.js';
-import { createEmulateTool } from './tools/emulate.js';
+import { createEmulateTools } from './tools/emulate.js';
 import { createStorageTool } from './tools/storage.js';
 import { createInterceptStore } from './lib/intercept.js';
 import { createInterceptTools } from './tools/intercept.js';
@@ -541,12 +541,11 @@ async function toolFind(args) {
   return ok([{type:'text',text:`Found ${merged.length} elements:\n\n${formatFindLines(merged).join('\n')}`}]);
 }
 
-async function toolFormInput(args) {
-  const {tabId,ref,value} = args;
-  if (!tabId) return err('tabId required');
-  if (!ref) return err('ref required');
+// form_input / form_input_multi 的核心：在 ref 所属 frame 里找到元素并设置值。
+// 单个设置与批量共享同一段页面侧函数，返回 { success, fieldName } 或 { success:false, error }。
+async function setFieldValue(tabId, ref, value) {
   const parsed = parseRef(ref);
-  if (!parsed) return err(refNotFound(ref));
+  if (!parsed) return { error: refNotFound(ref) };
   await ensureCs(tabId);
   const res = await runInRefFrame(tabId, parsed, (ref, value) => {
       const tree = globalThis.__accessibilityTree;
@@ -579,9 +578,36 @@ async function toolFormInput(args) {
       else { el.focus(); document.execCommand('selectAll',false,null); document.execCommand('insertText',false,String(value)); }
       return {success:true,fieldName:el.name||el.id||ref};
     }, [parsed.ref, value]);
-  if (!res) return err(refNotFound(ref));
-  if (!res.success) return err(res.error === 'not-found' ? refNotFound(ref) : (res.error||'Failed to set value'));
+  if (!res) return { error: refNotFound(ref) };
+  if (!res.success) return { error: res.error === 'not-found' ? refNotFound(ref) : (res.error||'Failed to set value') };
+  return { fieldName: res.fieldName };
+}
+
+async function toolFormInput(args) {
+  const {tabId,ref,value} = args;
+  if (!tabId) return err('tabId required');
+  if (!ref) return err('ref required');
+  const res = await setFieldValue(tabId, ref, value);
+  if (res.error) return err(res.error);
   return ok([{type:'text',text:`Set value for ${res.fieldName}`}]);
+}
+
+// form_input 的批量版：按顺序逐个设置，第一个失败即停并指明第几个字段、ref 与原因
+async function toolFormInputMulti(args) {
+  const {tabId, fields} = args;
+  if (!tabId) return err('tabId required');
+  if (!Array.isArray(fields) || !fields.length) return err('fields required');
+  let done = 0;
+  for (const field of fields) {
+    if (!field?.ref) return err(`field ${done + 1} of ${fields.length}: ref required`);
+    const res = await setFieldValue(tabId, field.ref, field.value);
+    if (res.error) {
+      const which = done ? ` (after ${done} field${done > 1 ? 's' : ''} set)` : '';
+      return err(`field ${done + 1} of ${fields.length}, ref "${field.ref}": ${res.error}${which}`);
+    }
+    done++;
+  }
+  return ok([{type:'text',text:`Set ${done} fields`}]);
 }
 async function toolNavigate(args) {
   const {tabId, url} = args;
@@ -882,7 +908,7 @@ async function toolState() {
   }) }]);
 }
 
-// ── performance / emulate ─────────────────────────────────────────────────────
+// ── performance / emulate 族 ──────────────────────────────────────────────────
 // tabId -> { events, truncated, resolve }  (Tracing.* 事件由 chrome.debugger.onEvent 填充)
 const traceSessions = new Map();
 // 设置过 emulate 覆盖的标签页 -> 已生效的项名集合：导航时不能 detach，否则覆盖随调试会话一起丢失；reset 时按项还原
@@ -1080,7 +1106,7 @@ async function toolPerformance(args) {
   } catch (e) { return err(e.message); }
 }
 
-const toolEmulate = createEmulateTool({ chrome, ok, err, ensureCdp, emulatedTabs, networkPresets: NETWORK_PRESETS });
+const { toolEmulateDevice, toolEmulateNetwork, toolEmulateGeo } = createEmulateTools({ chrome, ok, err, ensureCdp, emulatedTabs, networkPresets: NETWORK_PRESETS });
 
 const { toolJavascript, toolGetPageText, toolFileUpload } = createPageTools({
   chrome, ok, err, ensureCdp, ensureCs, runInRefFrame, getElemCoords, sleep, frameContexts,
@@ -1096,10 +1122,11 @@ const {
 });
 
 const TOOL_MAP = {
-  performance: toolPerformance, emulate: toolEmulate,
+  performance: toolPerformance,
+  emulate_device: toolEmulateDevice, emulate_network: toolEmulateNetwork, emulate_geo: toolEmulateGeo,
   computer: toolComputer, read_page: toolReadPage, find: toolFind,
   screenshot: toolScreenshot, click: toolClick, sleep: toolSleep,
-  form_input: toolFormInput, navigate: toolNavigate,
+  form_input: toolFormInput, form_input_multi: toolFormInputMulti, navigate: toolNavigate,
   javascript_tool: toolJavascript, get_page_text: toolGetPageText,
   file_upload: toolFileUpload, resize_window: toolResizeWindow,
   read_console_messages: toolReadConsole,
@@ -1125,7 +1152,7 @@ function err(msg) { return { content:[{type:'text',text:`Error: ${msg}`}], isErr
 // click 是拆出的顶层写工具，与 computer 的点击 action 同级排队
 const QUEUED_ACTIONS = new Set(['left_click','right_click','double_click','triple_click',
   'type','key','scroll','scroll_to','left_click_drag','hover','click']);
-const QUEUED_TOOLS = new Set(['form_input', 'navigate', 'file_upload', 'javascript_tool', 'tab_reload']);
+const QUEUED_TOOLS = new Set(['form_input', 'form_input_multi', 'navigate', 'file_upload', 'javascript_tool', 'tab_reload']);
 const STORAGE_WRITE_ACTIONS = new Set(['set', 'remove', 'clear']);
 
 function isQueuedCall(tool, args) {

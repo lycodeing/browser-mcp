@@ -37,12 +37,12 @@ test('公布的 schema 对数字/布尔/数组同时放行字符串形式', asyn
   }
 });
 
-test('工具清单恰好 34 个，旧工具已删除，新工具已就位', async () => {
+test('工具清单恰好 37 个，旧工具已删除，新工具已就位', async () => {
   const client = await connectClient();
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name);
-  assert.equal(names.length, 34);
-  for (const old of ['tabs_context', 'tabs_create', 'tabs_close', 'read_network_requests', 'tabs', 'network']) {
+  assert.equal(names.length, 37);
+  for (const old of ['tabs_context', 'tabs_create', 'tabs_close', 'read_network_requests', 'tabs', 'network', 'emulate']) {
     assert.ok(!names.includes(old), `${old} 应被删除`);
   }
   for (const name of [
@@ -51,6 +51,8 @@ test('工具清单恰好 34 个，旧工具已删除，新工具已就位', asyn
     'tab_reload', 'tab_duplicate', 'tab_group',
     'screenshot', 'click', 'sleep',
     'state',
+    'form_input_multi',
+    'emulate_device', 'emulate_network', 'emulate_geo',
     'storage',
   ]) {
     assert.ok(names.includes(name), `${name} 应存在`);
@@ -213,47 +215,112 @@ test('非法字符串被拒绝', async () => {
   assert.equal(res.isError, true);
 });
 
-test('emulate 新参数的字符串数字/布尔还原，旧参数仍可用', async () => {
+test('emulate_device 的字符串数字/布尔还原为原生类型', async () => {
   setExtensionWs(fakeWs);
   const client = await connectClient();
   received.length = 0;
   await client.callTool({
-    name: 'emulate',
+    name: 'emulate_device',
     arguments: {
-      tabId: '5', device: 'iphone-15', width: '500', height: '900', deviceScaleFactor: '2.5',
-      mobile: 'true', latitude: '35.68', longitude: '139.76', accuracy: '50',
-      timezone: 'Asia/Tokyo', locale: 'ja-JP',
+      tabId: '5', device: 'iphone-15', width: '500', height: '900',
+      deviceScaleFactor: '2.5', mobile: 'true', reset: 'false',
     },
   });
   const a = received[0].arguments;
-  assert.equal(received[0].tool, 'emulate');
+  assert.equal(received[0].tool, 'emulate_device');
   assert.equal(a.tabId, 5);
   assert.equal(a.width, 500);
   assert.equal(a.height, 900);
   assert.equal(a.deviceScaleFactor, 2.5);
   assert.equal(a.mobile, true);
-  assert.equal(a.latitude, 35.68);
-  assert.equal(a.longitude, 139.76);
-  assert.equal(a.accuracy, 50);
-  assert.equal(a.timezone, 'Asia/Tokyo');
-  assert.equal(a.locale, 'ja-JP');
+  assert.equal(a.reset, false);
 
   received.length = 0;
-  await client.callTool({ name: 'emulate', arguments: { tabId: 5, colorScheme: 'dark', cpuThrottlingRate: '4' } });
-  assert.equal(received[0].arguments.colorScheme, 'dark');
-  assert.equal(received[0].arguments.cpuThrottlingRate, 4);
+  await client.callTool({
+    name: 'emulate_device',
+    arguments: { tabId: 5, userAgent: 'Custom/1.0' },
+  });
+  assert.equal(received[0].arguments.userAgent, 'Custom/1.0');
 });
 
-test('emulate 新参数的范围与枚举约束', async () => {
+test('emulate_network 与 emulate_geo 的字符串数字还原为原生类型', async () => {
+  setExtensionWs(fakeWs);
+  const client = await connectClient();
+  received.length = 0;
+  await client.callTool({
+    name: 'emulate_network',
+    arguments: { tabId: '5', cpuThrottlingRate: '4', networkConditions: 'Slow 3G' },
+  });
+  assert.equal(received[0].tool, 'emulate_network');
+  assert.equal(received[0].arguments.tabId, 5);
+  assert.equal(received[0].arguments.cpuThrottlingRate, 4);
+  assert.equal(received[0].arguments.networkConditions, 'Slow 3G');
+
+  received.length = 0;
+  await client.callTool({
+    name: 'emulate_geo',
+    arguments: { tabId: '5', latitude: '35.68', longitude: '139.76', accuracy: '50' },
+  });
+  const g = received[0].arguments;
+  assert.equal(received[0].tool, 'emulate_geo');
+  assert.equal(g.tabId, 5);
+  assert.equal(g.latitude, 35.68);
+  assert.equal(g.longitude, 139.76);
+  assert.equal(g.accuracy, 50);
+});
+
+test('emulate 族的范围与枚举约束', async () => {
   setExtensionWs(fakeWs);
   const client = await connectClient();
   for (const bad of [
-    { device: 'nokia' }, { width: 100 }, { height: 5000 }, { deviceScaleFactor: 9 },
-    { latitude: 91, longitude: 0 }, { longitude: -181, latitude: 0 }, { accuracy: -1 },
+    ['emulate_device', { device: 'nokia' }],
+    ['emulate_device', { width: 100 }],
+    ['emulate_device', { height: 5000 }],
+    ['emulate_device', { deviceScaleFactor: 9 }],
+    ['emulate_geo', { latitude: 91, longitude: 0 }],
+    ['emulate_geo', { longitude: -181, latitude: 0 }],
+    ['emulate_geo', { accuracy: -1 }],
   ]) {
-    const res = await client.callTool({ name: 'emulate', arguments: { tabId: 1, ...bad } });
-    assert.equal(res.isError, true, `应拒绝 ${JSON.stringify(bad)}`);
+    const res = await client.callTool({ name: bad[0], arguments: { tabId: 1, ...bad[1] } });
+    assert.equal(res.isError, true, `应拒绝 ${bad[0]} ${JSON.stringify(bad[1])}`);
   }
+});
+
+test('form_input_multi 透传字段数组并限制数量', async () => {
+  setExtensionWs(fakeWs);
+  const client = await connectClient();
+  received.length = 0;
+  await client.callTool({
+    name: 'form_input_multi',
+    arguments: {
+      tabId: '5',
+      fields: [
+        { ref: 'ref_1', value: 'alice' },
+        { ref: 'ref_2', value: 'true' },
+        { ref: 'f3.ref_4', value: '42' },
+      ],
+    },
+  });
+  assert.equal(received[0].tool, 'form_input_multi');
+  assert.equal(received[0].arguments.tabId, 5);
+  assert.deepEqual(received[0].arguments.fields, [
+    { ref: 'ref_1', value: 'alice' },
+    { ref: 'ref_2', value: 'true' },
+    { ref: 'f3.ref_4', value: '42' },
+  ]);
+
+  // 超过 20 个字段被拒绝
+  const tooMany = await client.callTool({
+    name: 'form_input_multi',
+    arguments: { tabId: 5, fields: Array.from({ length: 21 }, (_, i) => ({ ref: `ref_${i}`, value: 'x' })) },
+  });
+  assert.equal(tooMany.isError, true);
+  // 空数组被拒绝
+  const empty = await client.callTool({
+    name: 'form_input_multi',
+    arguments: { tabId: 5, fields: [] },
+  });
+  assert.equal(empty.isError, true);
 });
 
 test('storage 的数字参数接受字符串形式并转换后下发', async () => {

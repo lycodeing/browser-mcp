@@ -129,6 +129,13 @@ const SCHEMAS = {
     ref: z.string().describe('Element ref from read_page or find'),
     value: z.union([z.string(), z.boolean(), z.number()]),
   },
+  form_input_multi: {
+    tabId: lenientTabId(),
+    fields: z.array(z.object({
+      ref: z.string().describe('Element ref from read_page or find'),
+      value: z.union([z.string(), z.boolean(), z.number()]),
+    })).min(1).max(20).describe('Fields to set in order'),
+  },
   navigate: {
     tabId: lenientTabId(),
     url: z.string().describe('URL, "back", or "forward"'),
@@ -260,23 +267,28 @@ const SCHEMAS = {
     action: z.enum(['metrics', 'trace_start', 'trace_stop']).describe('metrics: instant snapshot; trace_start/trace_stop: record a trace and get an analysed summary'),
     reload: bool().optional().default(false).describe('trace_start: reload the page (cache bypassed) once tracing begins, to capture load metrics'),
   },
-  emulate: {
+  emulate_device: {
+    tabId: lenientTabId(),
+    device: z.enum(['iphone-15', 'ipad-air', 'pixel-8']).optional().describe('Device preset: viewport, pixel ratio, touch, user agent'),
+    width: num(z.number().int().min(200).max(4000)).optional(),
+    height: num(z.number().int().min(200).max(4000)).optional(),
+    deviceScaleFactor: num(z.number().min(1).max(5)).optional(),
+    mobile: bool().optional(),
+    userAgent: z.string().optional().describe('Empty string resets'),
+    reset: bool().optional().default(false).describe('Clear all emulation overrides on the tab'),
+  },
+  emulate_network: {
     tabId: lenientTabId(),
     cpuThrottlingRate: num(z.number().min(1).max(20)).optional().describe('CPU slowdown factor, 1 = off'),
     networkConditions: z.enum(['Offline', 'Slow 3G', 'Fast 3G', 'Fast 4G', 'none']).optional().describe('Network throttling preset, none = off'),
-    colorScheme: z.enum(['dark', 'light', 'auto']).optional().describe('prefers-color-scheme override, auto = reset'),
-    userAgent: z.string().optional().describe('User agent override, empty string = reset'),
-    device: z.enum(['iphone-15', 'ipad-air', 'pixel-8']).optional().describe('Device preset: viewport, pixel ratio, touch and user agent. Explicit width/height/deviceScaleFactor/mobile/userAgent override the matching preset value'),
-    width: num(z.number().int().min(200).max(4000)).optional().describe('Viewport width in CSS px; needs height unless device is given'),
-    height: num(z.number().int().min(200).max(4000)).optional().describe('Viewport height in CSS px; needs width unless device is given'),
-    deviceScaleFactor: num(z.number().min(1).max(5)).optional().describe('Device pixel ratio'),
-    mobile: bool().optional().describe('Mobile viewport with touch events'),
-    latitude: num(z.number().min(-90).max(90)).optional().describe('Geolocation latitude; must be given together with longitude'),
-    longitude: num(z.number().min(-180).max(180)).optional().describe('Geolocation longitude; must be given together with latitude'),
-    accuracy: num(z.number().min(0).max(100000)).optional().describe('Geolocation accuracy in meters, default 100'),
-    timezone: z.string().optional().describe('IANA timezone name, e.g. Asia/Tokyo; empty string resets'),
-    locale: z.string().optional().describe('Locale such as ja-JP; changes Intl formatting, navigator.language and the Accept-Language request header; empty string resets'),
-    reset: bool().optional().default(false).describe('Clear all emulation overrides on the tab'),
+  },
+  emulate_geo: {
+    tabId: lenientTabId(),
+    latitude: num(z.number().min(-90).max(90)).optional().describe('Must be given together with longitude'),
+    longitude: num(z.number().min(-180).max(180)).optional().describe('Must be given together with latitude'),
+    accuracy: num(z.number().min(0).max(100000)).optional().describe('Meters, default 100'),
+    timezone: z.string().optional().describe('IANA name e.g. Asia/Tokyo; empty resets'),
+    locale: z.string().optional().describe('e.g. ja-JP; empty resets'),
   },
   storage: {
     action: z.enum(['list', 'get', 'set', 'remove', 'clear', 'idb']).describe('Storage operation'),
@@ -323,6 +335,7 @@ const DESCRIPTIONS = {
   read_page: 'Get accessibility tree of the page. Use filter="interactive" for inputs/buttons only.',
   find: 'Find page elements by keyword. Use exact visible text (e.g. "Submit", "Add to cart").',
   form_input: 'Set a value on a form field (input, select, textarea, contenteditable) by ref.',
+  form_input_multi: 'Set multiple form fields in one call. Each item needs a ref (from read_page/find) and a value. Stops at the first failure and reports which field failed.',
   navigate: 'Navigate to a URL, or go "back" / "forward" in history.',
   javascript_tool: 'Execute JavaScript in the page context. Optional frameId targets an iframe (0 = main frame, default); document/location/window then belong to that frame. Return value of the last expression is returned.',
   get_page_text: 'Extract plain text content from the page, prioritising article content. Default: main frame only. frameId extracts one iframe\'s text; allFrames:true merges every frame, each section headed by its frame and capped by max_chars overall.',
@@ -343,8 +356,10 @@ const DESCRIPTIONS = {
   save_pdf: 'Save the page as PDF to a local file via CDP printToPDF.',
   cookies: 'Read, set, remove, or clear browser cookies for a domain/URL (login-state management).',
   downloads: 'List downloads, wait for a download to complete and get its local path, or erase history entries.',
-  performance: 'Inspect page performance. "metrics" returns an instant snapshot (LCP, CLS, INP, FCP, TTFB, JS heap, DOM nodes, listeners, slowest resources). "trace_start" then "trace_stop" records a Chrome trace and returns a summary (long tasks, blocking time, main-thread breakdown, heaviest scripts); use reload:true on trace_start to capture page load. Combine with emulate to test under throttling.',
-  emulate: 'Emulate a device and environment on a tab (CDP): device presets (iphone-15, ipad-air, pixel-8) or custom width/height/deviceScaleFactor/mobile, geolocation, timezone, locale, CPU/network throttling, color scheme, user agent. Overrides stay until reset:true or the debugger detaches. Geolocation only reaches the page if the site already has location permission in Chrome; this tool cannot grant it.',
+  performance: 'Inspect page performance. "metrics" returns an instant snapshot (LCP, CLS, INP, FCP, TTFB, JS heap, DOM nodes, listeners, slowest resources). "trace_start" then "trace_stop" records a Chrome trace and returns a summary (long tasks, blocking time, main-thread breakdown, heaviest scripts); use reload:true on trace_start to capture page load. Combine with emulate_network to test under throttling.',
+  emulate_device: 'Emulate a device preset or custom viewport/DPR/touch/UA. Overrides stay until reset:true or the debugger detaches.',
+  emulate_network: 'Throttle CPU or network on a tab. Use for performance testing under constrained conditions.',
+  emulate_geo: 'Override geolocation, timezone, and locale on a tab. Only affects pages that already have location permission.',
   intercept_add: 'Intercept and mock network requests on a tab (CDP Fetch). Add a rule that matches requests by URL wildcard (and optionally method): fail aborts them with a network error, fulfill answers with a mock status/headers/body (text via body, binary via bodyBase64, up to 1 MB), delay holds them for delayMs. The first matching rule wins. Cross-origin mocks get access-control-allow-origin echoed and access-control-allow-credentials added, and CORS preflights are answered automatically. Rules last until intercept_remove, the tab closes, or the debugger detaches (DevTools opened); they survive extension restarts. Mocked requests still show up in network_list as normal responses.',
   intercept_list: 'List the intercept rules on a tab with their hit counts and whether interception is currently active.',
   intercept_remove: 'Remove one intercept rule by id, or all rules on the tab (omit ruleId), which also turns interception off.',
@@ -364,7 +379,7 @@ const QUEUE_WAIT_MS = 30000;
 /** 基础超时（不含排队等待），工具自身的执行时间预算 */
 const BASE_TIMEOUTS = {
   computer: 30000, screenshot: 15000, click: 15000, sleep: 12000,
-  form_input: 15000, navigate: 30000,
+  form_input: 15000, form_input_multi: 30000, navigate: 30000,
   file_upload: 30000, javascript_tool: 30000,
   network_list: 10000, network_detail: 15000,
   tabs_list: 5000, tab_create: 40000, tab_close: 10000,
@@ -373,13 +388,13 @@ const BASE_TIMEOUTS = {
   resize_window: 10000, read_console_messages: 10000,
   wait_for: 130000, handle_dialog: 5000, save_pdf: 60000,
   cookies: 10000, downloads: 610000,
-  performance: 60000, emulate: 10000, storage: 10000,
+  performance: 60000, emulate_device: 10000, emulate_network: 10000, emulate_geo: 10000, storage: 10000,
   intercept_add: 10000, intercept_list: 10000, intercept_remove: 10000,
   state: 5000,
 };
 
 /** 会进扩展侧串行队列的工具；其超时叠加排队等待，避免排队期间被 relay 判超时 */
-const QUEUED_TOOLS = new Set(['computer', 'click', 'form_input', 'navigate', 'file_upload', 'javascript_tool', 'tab_reload', 'storage']);
+const QUEUED_TOOLS = new Set(['computer', 'click', 'form_input', 'form_input_multi', 'navigate', 'file_upload', 'javascript_tool', 'tab_reload', 'storage']);
 
 /** 最终生效的超时表 = 基础表 + 排队工具的 QUEUE_WAIT_MS */
 export const TOOL_TIMEOUTS = Object.fromEntries(

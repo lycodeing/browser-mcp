@@ -1,13 +1,17 @@
-// emulate 工具的胶水实现：视口/触摸/UA/时区/语言/位置，加上原有的 CPU、网络、配色。
+// emulate 工具族：由原先的单一 emulate 拆成三个语义清晰的工具。
+// - emulate_device：视口/DPR/触摸/UA/设备预设
+// - emulate_network：CPU 降速与网络限速
+// - emulate_geo：地理位置、时区、语言
 // 依赖（chrome、ok、err、ensureCdp、emulatedTabs、networkPresets）通过参数注入。
 // emulatedTabs 是 Map<tabId, Set<项名>>，既用于导航时不断开调试器，也用于 reset 时逐项还原。
 // 应用顺序固定；中途失败不回滚，已生效的项保留并在报错里列出。
+// reset 由 emulate_device 承载（与旧 emulate 的 reset 一致，逐项还原全部覆盖）。
 
 import { planEmulation } from '../lib/emulation.js';
 
 const GEO_NOTE = 'Note: the page can only read this location if the site already has location permission in Chrome; this tool cannot grant it.';
 
-export function createEmulateTool({ chrome, ok, err, ensureCdp, emulatedTabs, networkPresets }) {
+export function createEmulateTools({ chrome, ok, err, ensureCdp, emulatedTabs, networkPresets }) {
   // tabId -> 最近一次 setUserAgentOverride 的参数，仅在 emulatedTabs 记录了 ua 时才可信
   const lastUa = new Map();
 
@@ -27,7 +31,8 @@ export function createEmulateTool({ chrome, ok, err, ensureCdp, emulatedTabs, ne
     return r?.result?.value ?? '';
   }
 
-  async function applyPlan(tabId, plan, send) {
+  // 执行计划中的设备类项（viewport、touch、ua）；任何一项失败抛错并带上已生效项
+  async function applyDevicePlan(tabId, plan, send) {
     const applied = [];
     const step = async (label, fn) => {
       try { return await fn(); } catch (e) {
@@ -36,23 +41,6 @@ export function createEmulateTool({ chrome, ok, err, ensureCdp, emulatedTabs, ne
         throw err2;
       }
     };
-
-    if (plan.cpu != null) {
-      await step('CPU throttling', () => send('Emulation.setCPUThrottlingRate', { rate: plan.cpu }));
-      applied.push(`CPU throttling ${plan.cpu}x`); mark(tabId, 'cpu');
-    }
-    if (plan.network != null) {
-      const preset = networkPresets[plan.network];
-      if (!preset) throw Object.assign(new Error(`Unknown networkConditions: ${plan.network}`), { applied });
-      await step('network', () => send('Network.emulateNetworkConditions', preset));
-      applied.push(`network ${plan.network}`); mark(tabId, 'network');
-    }
-    if (plan.scheme != null) {
-      await step('color scheme', () => send('Emulation.setEmulatedMedia', {
-        features: [{ name: 'prefers-color-scheme', value: plan.scheme === 'auto' ? '' : plan.scheme }],
-      }));
-      applied.push(`color scheme ${plan.scheme}`); mark(tabId, 'scheme');
-    }
 
     if (plan.viewport) {
       const v = plan.viewport;
@@ -98,6 +86,43 @@ export function createEmulateTool({ chrome, ok, err, ensureCdp, emulatedTabs, ne
         lastUa.delete(tabId);
       }
     }
+    return applied;
+  }
+
+  // 执行计划中的网络类项（cpu、network）
+  async function applyNetworkPlan(tabId, plan, send) {
+    const applied = [];
+    const step = async (label, fn) => {
+      try { return await fn(); } catch (e) {
+        const err2 = new Error(`${label} failed: ${e.message}`);
+        err2.applied = applied;
+        throw err2;
+      }
+    };
+
+    if (plan.cpu != null) {
+      await step('CPU throttling', () => send('Emulation.setCPUThrottlingRate', { rate: plan.cpu }));
+      applied.push(`CPU throttling ${plan.cpu}x`); mark(tabId, 'cpu');
+    }
+    if (plan.network != null) {
+      const preset = networkPresets[plan.network];
+      if (!preset) throw Object.assign(new Error(`Unknown networkConditions: ${plan.network}`), { applied });
+      await step('network', () => send('Network.emulateNetworkConditions', preset));
+      applied.push(`network ${plan.network}`); mark(tabId, 'network');
+    }
+    return applied;
+  }
+
+  // 执行计划中的地理类项（timezone、locale、geo）；locale 的 acceptLanguage 部分由设备类共享
+  async function applyGeoPlan(tabId, plan, send) {
+    const applied = [];
+    const step = async (label, fn) => {
+      try { return await fn(); } catch (e) {
+        const err2 = new Error(`${label} failed: ${e.message}`);
+        err2.applied = applied;
+        throw err2;
+      }
+    };
 
     if (plan.timezone !== undefined) {
       await step('timezone', () => send('Emulation.setTimezoneOverride', { timezoneId: plan.timezone }));
@@ -142,7 +167,9 @@ export function createEmulateTool({ chrome, ok, err, ensureCdp, emulatedTabs, ne
     return { done, failed };
   }
 
-  return async function toolEmulate(args) {
+  // 把公共流程封成工厂：校验入参 → 附加调试器 → 执行计划 → 汇报。
+  // pickDescription 决定"Nothing to apply"错误里列出该工具支持的参数。
+  const makeRunner = ({ planKeys, hint, run, extraNotes }) => async function toolEmulateX(args) {
     const { tabId, reset = false } = args;
     if (!tabId) return err('tabId required');
 
@@ -152,9 +179,8 @@ export function createEmulateTool({ chrome, ok, err, ensureCdp, emulatedTabs, ne
       const planned = planEmulation(args);
       if (planned.error) return err(planned.error);
       plan = planned.plan;
-      if (!Object.keys(plan).length) {
-        return err('Nothing to apply: pass device, width/height, latitude/longitude, timezone, locale, cpuThrottlingRate, networkConditions, colorScheme, userAgent or reset');
-      }
+      const hasWork = planKeys.some((k) => plan[k] !== undefined);
+      if (!hasWork) return err(`Nothing to apply: pass ${hint}`);
     }
 
     try {
@@ -169,17 +195,47 @@ export function createEmulateTool({ chrome, ok, err, ensureCdp, emulatedTabs, ne
         return ok([{ type: 'text', text: `Emulation reset: ${done.join(', ')}.` }]);
       }
 
-      const applied = await applyPlan(tabId, plan, send);
-      const notes = [`Emulation applied: ${applied.join(', ')}. Overrides last until the debugger detaches (tab closed or DevTools opened) or reset:true.`];
-      if (plan.geo) notes.push(GEO_NOTE);
-      if (plan.locale) notes.push('locale also sets Accept-Language on requests the page sends.');
+      const applied = await run(tabId, plan, send);
+      const notes = [`Emulation applied: ${applied.join(', ')}. Overrides last until the debugger detaches (tab closed or DevTools opened) or reset on emulate_device.`];
+      for (const note of extraNotes(plan)) if (note) notes.push(note);
       return ok([{ type: 'text', text: notes.join('\n') }]);
     } catch (e) {
       if (e.applied) {
         const kept = e.applied.length ? ` Already applied and kept: ${e.applied.join(', ')}.` : ' Nothing was applied before the failure.';
-        return err(`${e.message}.${kept} Call with reset:true to undo.`);
+        return err(`${e.message}.${kept} Call emulate_device with reset:true to undo.`);
       }
       return err(e.message);
     }
   };
+
+  const toolEmulateDevice = makeRunner({
+    planKeys: ['viewport', 'ua'],
+    hint: 'device, width/height, deviceScaleFactor, mobile, userAgent or reset',
+    run: applyDevicePlan,
+    extraNotes: () => [],
+  });
+
+  const toolEmulateNetwork = makeRunner({
+    planKeys: ['cpu', 'network'],
+    hint: 'cpuThrottlingRate or networkConditions',
+    run: applyNetworkPlan,
+    extraNotes: () => [],
+  });
+
+  const toolEmulateGeo = makeRunner({
+    planKeys: ['timezone', 'locale', 'geo'],
+    hint: 'latitude/longitude, timezone or locale',
+    run: (tabId, plan, send) => applyGeoPlan(tabId, plan, send).then(async (applied) => {
+      // locale 需要同时下发 acceptLanguage（挂在 setUserAgentOverride 上），与设备类共享实现
+      if (plan.locale === undefined) return applied;
+      const deviceApplied = await applyDevicePlan(tabId, { locale: plan.locale }, send);
+      return [...applied, ...deviceApplied.filter((a) => !applied.includes(a))];
+    }),
+    extraNotes: (plan) => [
+      plan.geo ? GEO_NOTE : null,
+      plan.locale ? 'locale also sets Accept-Language on requests the page sends.' : null,
+    ],
+  });
+
+  return { toolEmulateDevice, toolEmulateNetwork, toolEmulateGeo };
 }
