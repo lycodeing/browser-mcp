@@ -15,7 +15,7 @@ import { createInterceptTools } from './tools/intercept.js';
 import { createPageTools } from './tools/page-tools.js';
 import { createComputerTools } from './tools/computer-tools.js';
 import {
-  parseRef, mergeFrameTrees, mergeFindResults, formatFindLines, resolveFrameOffset, toTopPoint,
+  parseRef, formatRef, mergeFrameTrees, mergeFindResults, formatFindLines, resolveFrameOffset, toTopPoint,
 } from './lib/frames.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -148,8 +148,401 @@ async function ensureCs(tabId) {
   await chrome.scripting.executeScript({
     target: { tabId, allFrames: true },
     files: ['content-scripts/accessibility-tree.js', 'content-scripts/page-bridge.js',
-            'content-scripts/frame-link.js'],
+            'content-scripts/frame-link.js', 'content-scripts/recorder.js'],
   });
+}
+
+// ── 操作录制 ─────────────────────────────────────────────────────────────────
+// content script 无法持有 background 的函数引用，事件经 chrome.runtime.sendMessage
+// 上报；跨 frame 时 executeScript 的 results 数组自带注入 frame 的数字 frameId，
+// start 时写进各 frame 的 __recorderFrameId，产出带 frameId 的 target 供回放定位。
+
+// tabId -> RecordingSession
+const recordingSessions = new Map();
+// 录制中高亮走 executeScript 注入；captureScreenshot 需要 CDP，先确保已附加
+async function captureGifFrame(tabId, session, record) {
+  try {
+    await ensureCdp(tabId);
+  } catch {
+    return; // 受限页面（chrome:// 等）截不了帧，步骤仍然记录
+  }
+  try {
+    if (record.step?.args?.target) {
+      await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        func: (target, type) => {
+          // 高亮按 target 里的 cssPath 找元素，找不到就退化到视口左上角的小框
+          const el = document.querySelector(target.cssPath || '');
+          if (globalThis.__recorder?.injectHighlight) {
+            globalThis.__recorder.injectHighlight(el || { left: 8, top: 8, width: 24, height: 24 }, type);
+          }
+        },
+        args: [{ ...record.step.args.target }, record.type === 'input' ? 'input' : 'click'],
+      });
+      await sleep(100);
+    }
+    const { data, width, height } = await captureScreenshot(tabId, {
+      format: 'jpeg', quality: 70, maxDimension: 960,
+    });
+    session.frames.push({
+      stepIndex: session.steps.length - 1,
+      dataUrl: `data:image/jpeg;base64,${data}`,
+      width, height,
+      capturedAt: Date.now(),
+    });
+  } catch {
+    // 单帧失败不影响录制继续
+  }
+}
+
+// recorder 上报事件的入口：入 session.steps，captureGif 开启时补帧。
+function handleRecorderEvent(tabId, record) {
+  const session = recordingSessions.get(tabId);
+  if (!session || !record?.step?.tool) return;
+  session.steps.push(record.step);
+  session.lastEventAt = Date.now();
+  if (session.captureGif) captureGifFrame(tabId, session, record);
+}
+
+function recordingState(tabId) {
+  const session = recordingSessions.get(Number(tabId));
+  if (!session) return { isRecording: false, tabId: Number(tabId) };
+  return {
+    isRecording: true,
+    tabId: session.tabId,
+    startedAt: session.startedAt,
+    stepsCount: session.steps.length,
+    framesCount: session.frames.length,
+    captureGif: session.captureGif,
+    elapsedMs: Date.now() - session.startedAt,
+  };
+}
+
+// relay 专用 method（record/start 等）与 popup 消息（record:*）共用实现
+async function toolRecordStart(args) {
+  const tabId = args?.tabId;
+  if (!Number.isInteger(tabId)) return err('tabId is required');
+  if (recordingSessions.has(tabId)) return err(`Already recording tab ${tabId}; call record_stop first`);
+  await ensureCs(tabId);
+  const session = {
+    tabId,
+    startedAt: Date.now(),
+    steps: [],
+    frames: [],
+    captureGif: args.captureGif !== false,
+    lastEventAt: Date.now(),
+  };
+  recordingSessions.set(tabId, session);
+  let frameCount = 0;
+  try {
+    // 每个 frame 注入一个转发 handler：事件 → chrome.runtime.sendMessage → background。
+    // executeScript 的注入函数无法携带闭包，但各 frame 注入时 result 带自身 frameId，
+    // 先收集再逐 frame 激活，把 frameId 写进 __recorderFrameId（回放定位用）。
+    const prepared = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => {
+        if (!globalThis.__recorder) return false;
+        if (!globalThis.__recorderPrepared) {
+          globalThis.__recorderPrepared = true;
+          chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
+            if (msg?.type === 'recorder:activate') {
+              try {
+                globalThis.__recorderFrameId = msg.frameId;
+                globalThis.__recorder.start((record) => {
+                  chrome.runtime.sendMessage({ type: 'recorder:event', tabId: msg.tabId, record });
+                });
+              } catch { /* start 重复调用时忽略 */ }
+              reply({ started: true });
+            } else if (msg?.type === 'recorder:ping') {
+              reply({ frameId: msg.frameId });
+            }
+            return false;
+          });
+        }
+        return true;
+      },
+    });
+    const readyFrames = prepared.filter(r => r.result === true);
+    frameCount = readyFrames.length;
+    for (const fr of readyFrames) {
+      await chrome.runtime.sendMessage({
+        type: 'recorder:activate', tabId, frameId: fr.frameId,
+      }).catch(() => {});
+    }
+    if (!frameCount) throw new Error('recorder content script not present in any frame');
+  } catch (e) {
+    recordingSessions.delete(tabId);
+    return err(`Failed to start recording: ${e.message}`);
+  }
+  const gif = session.captureGif ? ', GIF frame capture on' : '';
+  return ok([{ type: 'text', text: `Recording started on tab ${tabId} (${frameCount} frame(s)${gif})` }]);
+}
+
+async function toolRecordStop(args) {
+  const tabId = args?.tabId;
+  if (!Number.isInteger(tabId)) return err('tabId is required');
+  const session = recordingSessions.get(tabId);
+  if (!session) return err(`No recording in progress on tab ${tabId}`);
+  recordingSessions.delete(tabId);
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => { globalThis.__recorder?.stop(); },
+    });
+  } catch { /* 页面可能已导航，忽略 */ }
+
+  const steps = session.steps;
+  const flow = {
+    version: 1,
+    recordedAt: new Date(session.startedAt).toISOString(),
+    steps,
+  };
+  const lines = steps.map((s, i) => `${i + 1}. [${s.tool}] ${s.note || ''}`);
+  const gif = session.frames.length ? `, ${session.frames.length} frames` : '';
+  const result = ok([{
+    type: 'text',
+    text: `Recording stopped: ${steps.length} step(s)${gif}\n\n${lines.join('\n') || '(no steps)'}\n\n${JSON.stringify(steps)}`,
+  }]);
+
+  if (args.name) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return err(`Relay not connected; cannot save flow "${args.name}". Steps are included above.`);
+    }
+    const saveFlow = {
+      name: args.name,
+      flow,
+      frames: session.frames.map(({ stepIndex, dataUrl, width, height, capturedAt }) =>
+        ({ stepIndex, dataUrl, width, height, capturedAt })),
+    };
+    // fire-and-forget：relay 侧 record/stop 的 result.saveFlow 会在 MCP 层落盘，
+    // 这里同时发一条 flow/save 供 popup 直连路径（不经 relay MCP）使用
+    sendMsg({ method: 'flow/save', params: { tabId, saveFlow, saveTo: args.saveTo ?? null } });
+    result.content.push({ type: 'text', text: `Saving flow "${args.name}" to relay (~/.browser-mcp/flows/)` });
+    result.saveFlow = saveFlow; // relay 侧读到该字段后落盘
+  }
+  return result;
+}
+
+async function toolRecordList() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return err('Relay not connected; record_list needs the relay (flows live on the relay side)');
+  }
+  let flows;
+  try {
+    flows = await requestFromRelay('flow/list', {}, 5000);
+  } catch (e) {
+    return err(e.message);
+  }
+  if (!Array.isArray(flows)) return err('Relay returned no flow list');
+  const lines = flows.map(f =>
+    `${f.name} | ${f.steps} step(s)${f.gifSize ? ` | gif ${(f.gifSize / 1024).toFixed(0)}KB` : ''}${f.recordedAt ? ` | ${f.recordedAt}` : ''}`);
+  return ok([{ type: 'text', text: flows.length ? `${flows.length} flow(s):\n${lines.join('\n')}` : 'No saved flows' }]);
+}
+
+async function toolRecordRun(args) {
+  const { tabId, name, strict = true, stepDelayMs = 300 } = args || {};
+  if (!Number.isInteger(tabId)) return err('tabId is required');
+  if (!name) return err('name is required');
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return err('Relay not connected; record_run loads the flow JSON from the relay');
+  }
+  let flow;
+  try {
+    flow = await requestFromRelay('flow/load', { name }, 10000);
+  } catch (e) {
+    return err(e.message);
+  }
+  if (!flow) return err(`Relay did not return flow "${name}" (missing or relay offline)`);
+  const steps = Array.isArray(flow.steps) ? flow.steps : null;
+  if (!steps?.length) return err(`Flow "${name}" has no steps`);
+
+  const results = [];
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    let outcome;
+    try {
+      outcome = await replayStep(tabId, step, strict);
+    } catch (e) {
+      if (strict) {
+        return err(`Step ${i + 1}/${steps.length} (${step.note || step.tool}) failed: ${e.message}`);
+      }
+      results.push(`step ${i + 1} (${step.tool}): skipped — ${e.message}`);
+      continue;
+    }
+    if (outcome?.skipped) results.push(`step ${i + 1} (${step.tool}): skipped — ${outcome.reason}`);
+    else results.push(`step ${i + 1} (${step.tool}): ${step.note || 'ok'}`);
+    if (i < steps.length - 1) await sleep(Math.min(stepDelayMs, 5000));
+  }
+  return ok([{ type: 'text', text: `Replayed "${name}" on tab ${tabId}: ${steps.length} step(s)\n${results.join('\n')}` }]);
+}
+
+// 单步回放；strict=false 时失败返回 { skipped, reason }，strict=true 抛错（附候选）
+async function replayStep(tabId, step, strict) {
+  const args = step.args || {};
+  switch (step.tool) {
+    case 'navigate':
+      return void (await toolNavigate({ tabId, url: args.url }));
+    case 'wait_for':
+      return void (await toolWaitFor({ tabId, ...args }));
+    case 'downloads':
+      return void (await toolDownloads({ ...args }));
+    case 'key':
+      return void (await toolComputer({ tabId, action: 'key', text: args.key }));
+    case 'click': {
+      const found = await findElementByTarget(tabId, args.target);
+      if (found.error) {
+        const msg = `target not found: ${describeTarget(args.target)} — ${found.error}`;
+        if (strict) throw new Error(msg);
+        return { skipped: true, reason: msg };
+      }
+      return void (await toolClick({ tabId, ref: found.ref }));
+    }
+    case 'form_input': {
+      const found = await findElementByTarget(tabId, args.target);
+      if (found.error) {
+        const msg = `target not found: ${describeTarget(args.target)} — ${found.error}`;
+        if (strict) throw new Error(msg);
+        return { skipped: true, reason: msg };
+      }
+      return void (await toolFormInput({ tabId, ref: found.ref, value: args.value }));
+    }
+    default:
+      return { skipped: true, reason: `unknown tool "${step.tool}"` };
+  }
+}
+
+function describeTarget(target) {
+  if (!target) return '(no target)';
+  const parts = [];
+  if (target.text) parts.push(`text="${target.text}"`);
+  if (target.ariaLabel) parts.push(`aria="${target.ariaLabel}"`);
+  if (target.placeholder) parts.push(`placeholder="${target.placeholder}"`);
+  if (target.role) parts.push(`role=${target.role}`);
+  if (target.tag) parts.push(`tag=${target.tag}`);
+  if (target.cssPath) parts.push(`css=${target.cssPath}`);
+  if (target.frameId) parts.push(`frame=f${target.frameId}`);
+  return parts.join(' ') || JSON.stringify(target).slice(0, 120);
+}
+
+// target 多路兜底定位：text → aria/placeholder → role+tag → cssPath，
+// 前三级限制在录制时的 frame（若有），返回 { ref } 或 { error, candidates }
+async function findElementByTarget(tabId, target) {
+  if (!target) return { error: 'empty target' };
+  await ensureCs(tabId);
+  const frameIds = Number.isInteger(target.frameId) && target.frameId > 0 ? [target.frameId] : undefined;
+
+  if (target.text) {
+    const perFrame = await searchAllFrames(tabId, target.text, 20);
+    const frames = frameIds ? perFrame.filter(f => frameIds.includes(f.frameId)) : perFrame;
+    let best = null;
+    for (const f of frames) {
+      for (const it of f.items) {
+        if (it.text === target.text && (!best || it.score > best.score)) {
+          best = { ...it, frameId: f.frameId };
+        }
+      }
+    }
+    if (best) return { ref: formatRef(best.frameId, best.ref) };
+  }
+
+  if (target.ariaLabel || target.placeholder) {
+    const found = await findByAria(tabId, target, frameIds);
+    if (found) return found;
+  }
+
+  if (target.role && target.tag) {
+    const found = await findByAria(tabId, target, frameIds);
+    if (found) return found;
+  }
+
+  if (target.cssPath) {
+    const results = await chrome.scripting.executeScript({
+      target: frameIds ? { tabId, frameIds } : { tabId, allFrames: true },
+      func: (cssPath) => {
+        const el = document.querySelector(cssPath);
+        if (!el) return null;
+        const tree = globalThis.__accessibilityTree;
+        return tree ? { ref: tree.getOrAssignRef(el) } : null;
+      },
+      args: [target.cssPath],
+    }).catch(() => []);
+    const hit = results.find(r => r.result);
+    if (hit) return { ref: formatRef(hit.frameId, hit.result.ref) };
+  }
+
+  // 全部落空：带出最近候选供报错展示
+  let candidates = [];
+  if (target.text) {
+    const perFrame = await searchAllFrames(tabId, target.text, 5);
+    candidates = perFrame.flatMap(f => f.items).slice(0, 5).map(c => `"${c.text}" (score ${c.score})`);
+  }
+  return {
+    error: candidates.length
+      ? `closest candidates: ${candidates.join(', ')}`
+      : 'no matching element in any strategy',
+    candidates,
+  };
+}
+
+// aria-label / placeholder / role+tag 匹配：遍历可交互元素，属性值归一空白后比较
+async function findByAria(tabId, target, frameIds) {
+  const attr = {};
+  if (target.ariaLabel) attr.ariaLabel = target.ariaLabel;
+  if (target.placeholder) attr.placeholder = target.placeholder;
+  if (target.role) attr.role = target.role;
+  if (target.tag) attr.tag = target.tag;
+  const results = await chrome.scripting.executeScript({
+    target: frameIds ? { tabId, frameIds } : { tabId, allFrames: true },
+    func: (a) => {
+      const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+      const matches = (el) => {
+        if (a.ariaLabel && norm(el.getAttribute('aria-label') || el.getAttribute('title')) !== a.ariaLabel) return false;
+        if (a.placeholder && norm(el.getAttribute('placeholder')) !== a.placeholder) return false;
+        const role = el.getAttribute('role') || el.tagName.toLowerCase();
+        if (a.role && norm(role) !== a.role) return false;
+        if (a.tag && el.tagName.toLowerCase() !== a.tag) return false;
+        return true;
+      };
+      const tree = globalThis.__accessibilityTree;
+      if (!tree) return null;
+      const out = [];
+      for (const el of document.querySelectorAll('a,button,input,select,textarea,[role]')) {
+        if (!matches(el)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue;
+        out.push({ ref: tree.getOrAssignRef(el) });
+        if (out.length >= 1) break;
+      }
+      return out[0] || null;
+    },
+    args: [attr],
+  }).catch(() => []);
+  const hit = results.find(r => r.result);
+  return hit ? { ref: formatRef(hit.frameId, hit.result.ref) } : null;
+}
+
+async function toolRecordDelete(args) {
+  const name = args?.name;
+  if (!name) return err('name is required');
+  if (!ws || ws.readyState !== WebSocket.OPEN) return err('Relay not connected; record_delete needs the relay');
+  sendMsg({ method: 'flow/delete', params: { name } });
+  return ok([{ type: 'text', text: `Delete request for flow "${name}" sent to relay` }]);
+}
+
+async function toolRecordExportGif(args) {
+  const name = args?.name;
+  if (!name) return err('name is required');
+  if (!ws || ws.readyState !== WebSocket.OPEN) return err('Relay not connected; record_export_gif runs on the relay');
+  sendMsg({ method: 'flow/export', params: { name, kind: 'gif', saveTo: args.saveTo ?? null } });
+  return ok([{ type: 'text', text: `GIF export request for "${name}" sent to relay (default: user home dir; pass saveTo for a specific dir)` }]);
+}
+
+async function toolRecordExportJson(args) {
+  const name = args?.name;
+  if (!name) return err('name is required');
+  if (!ws || ws.readyState !== WebSocket.OPEN) return err('Relay not connected; record_export_json runs on the relay');
+  sendMsg({ method: 'flow/export', params: { name, kind: 'json', saveTo: args.saveTo ?? null } });
+  return ok([{ type: 'text', text: `JSON export request for "${name}" sent to relay (default: user home dir; pass saveTo for a specific dir)` }]);
 }
 
 const refNotFound = (refStr) => parseRef(refStr)?.frameId
@@ -1139,10 +1532,14 @@ const TOOL_MAP = {
   wait_for: toolWaitFor, handle_dialog: toolHandleDialog, save_pdf: toolSavePdf,
   cookies: toolCookies, downloads: toolDownloads,
   state: toolState,
+  record_start: toolRecordStart, record_stop: toolRecordStop, record_list: toolRecordList,
+  record_run: toolRecordRun, record_delete: toolRecordDelete,
+  record_export_gif: toolRecordExportGif, record_export_json: toolRecordExportJson,
 };
 
 // wait_for/downloads 的长超时工具放宽 WS 层兜底（relay 侧另有逐工具超时）
-const EXT_TOOL_TIMEOUTS = { wait_for: 135000, downloads: 620000, save_pdf: 70000, performance: 70000 };
+// record_run 内部逐 tool 分发，回放的整体超时由 EXT_TOOL_TIMEOUTS.record_run 兜底
+const EXT_TOOL_TIMEOUTS = { wait_for: 135000, downloads: 620000, save_pdf: 70000, performance: 70000, record_run: 300000 };
 
 // ── Response helpers ──────────────────────────────────────────────────────────
 function ok(content) { return { content }; }
@@ -1153,6 +1550,8 @@ function err(msg) { return { content:[{type:'text',text:`Error: ${msg}`}], isErr
 const QUEUED_ACTIONS = new Set(['left_click','right_click','double_click','triple_click',
   'type','key','scroll','scroll_to','left_click_drag','hover','click']);
 const QUEUED_TOOLS = new Set(['form_input', 'form_input_multi', 'navigate', 'file_upload', 'javascript_tool', 'tab_reload']);
+// 录制工具会话内保持状态，与其他写操作串行避免交叉；record_run 自身逐步分发到队列工具，不重复排队
+const QUEUED_RECORD_TOOLS = new Set(['record_start', 'record_stop']);
 const STORAGE_WRITE_ACTIONS = new Set(['set', 'remove', 'clear']);
 
 function isQueuedCall(tool, args) {
@@ -1160,6 +1559,7 @@ function isQueuedCall(tool, args) {
   if (tool === 'computer') return QUEUED_ACTIONS.has(args.action);
   if (tool === 'click') return true;
   if (tool === 'storage') return STORAGE_WRITE_ACTIONS.has(args.action);
+  if (QUEUED_RECORD_TOOLS.has(tool)) return true;
   return QUEUED_TOOLS.has(tool);
 }
 
@@ -1169,6 +1569,16 @@ async function handleMessage(raw) {
   try { msg = JSON.parse(raw); } catch { return; }
 
   if (msg.method === 'ping') { sendMsg({method:'pong'}); return; }
+  // requestFromRelay 发出的 flow/* 请求由 relay 以 {id, result} 回执，在此结算 pending
+  if (typeof msg.id === 'number' && !msg.method && relayPending.size) {
+    const pending = relayPending.get(msg.id);
+    if (pending) {
+      relayPending.delete(msg.id);
+      clearTimeout(pending.timer);
+      pending.resolve(msg.result);
+      return;
+    }
+  }
   if (msg.method === 'tools/discover') {
     sendMsg({id:msg.id, result:{tools:Object.keys(TOOL_MAP).map(name=>({name}))}}); return;
   }
@@ -1194,7 +1604,44 @@ async function handleMessage(raw) {
     } catch(e) {
       sendMsg({id:msg.id, error:{code:'INTERNAL_ERROR',message:e.message||String(e)}});
     }
+    return;
   }
+  // relay 发来的 record_* 专用 method（schema 校验与超时在 relay 侧完成）
+  const RECORD_RELAY_METHODS = {
+    'record/start': 'record_start', 'record/stop': 'record_stop',
+    'record/run': 'record_run', 'record/delete': 'record_delete',
+  };
+  const recordTool = RECORD_RELAY_METHODS[msg.method];
+  if (recordTool && typeof msg.id === 'number') {
+    try {
+      const run = () => withTimeout(TOOL_MAP[recordTool](msg.params ?? {}),
+        EXT_TOOL_TIMEOUTS[recordTool] ?? TOOL_TIMEOUT, recordTool);
+      const result = isQueuedCall(recordTool, msg.params ?? {})
+        ? await tabQueue.run(msg.params?.tabId, run) : await run();
+      sendMsg({id:msg.id, result});
+    } catch (e) {
+      sendMsg({id:msg.id, error:{code:'INTERNAL_ERROR',message:e.message||String(e)}});
+    }
+    return;
+  }
+  // 流程数据通道：relay 收到后以 {id, result} 回执，由 requestFromRelay 结算
+}
+
+// relay 用 {id, method, params} + 响应 {id, result} 的模式对讲（bridge.sendToExtension）。
+// 流程数据（列表/内容）存在 relay 的 flows-store 里，record_list/record_run 经此拉取。
+let relayRequestId = 0;
+const relayPending = new Map(); // id -> { resolve, reject, timer }
+
+function requestFromRelay(method, params, timeoutMs = 8000) {
+  const id = ++relayRequestId;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      relayPending.delete(id);
+      reject(new Error(`relay did not answer ${method} within ${timeoutMs}ms`));
+    }, timeoutMs);
+    relayPending.set(id, { resolve, reject, timer });
+    sendMsg({ id, method, params: params ?? {} });
+  });
 }
 
 // ── Chrome event listeners ────────────────────────────────────────────────────
@@ -1277,6 +1724,7 @@ chrome.tabs.onRemoved.addListener(tabId => {
   tabQueue.clear(tabId);
   traceSessions.delete(tabId);
   emulatedTabs.delete(tabId);
+  recordingSessions.delete(tabId);
   intercept.handleTabRemoved(tabId);
   tabEventBuffers.delete(tabId);
   shotScale.delete(tabId);
@@ -1286,6 +1734,18 @@ chrome.tabs.onRemoved.addListener(tabId => {
 
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.status === 'loading') {
+    // 录制中检测到导航：自动补 navigate + wait_for 两步（URL 由 info.url 或 tabs.get 兜底取）
+    const session = recordingSessions.get(tabId);
+    if (session) {
+      const url = info.url || null;
+      const pushNavigate = (navUrl) => {
+        session.steps.push({ tool: 'navigate', args: { url: navUrl }, note: `打开 ${navUrl}`, ts: Date.now() });
+        session.steps.push({ tool: 'wait_for', args: { condition: 'network_idle', timeoutMs: 10000 }, note: '等待页面加载', ts: Date.now() });
+        session.lastEventAt = Date.now();
+      };
+      if (url) pushNavigate(url);
+      else chrome.tabs.get(tabId).then(t => { if (t?.url) pushNavigate(t.url); }).catch(() => {});
+    }
     // trace 与 emulate 覆盖依赖同一个调试会话，加载期间不能断开，否则 reload 压测会丢数据
     if (traceSessions.has(tabId) || emulatedTabs.has(tabId) || interceptStore.isActive(tabId)) return;
     // 页面开始加载时 CDP 会话失效，需重新附加
@@ -1294,6 +1754,30 @@ chrome.tabs.onUpdated.addListener((tabId, info) => {
 });
 
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
+  // content script 的录制事件上报（各 frame 的 __recorder 转发）
+  if (msg?.type === 'recorder:event') {
+    handleRecorderEvent(msg.tabId, msg.record);
+    reply({ ok: true });
+    return false;
+  }
+  // popup 的录制面板入口：复用 record_* 工具 handler，统一 MCP/双端行为。
+  // popup 消息参数直接平铺在 msg 上（tabId/name/...），与工具参数形状一致。
+  const RECORD_POPUP_HANDLERS = {
+    'record:start': toolRecordStart,
+    'record:stop': toolRecordStop,
+    'record:list': toolRecordList,
+    'record:run': toolRecordRun,
+    'record:delete': toolRecordDelete,
+  };
+  const popupHandler = RECORD_POPUP_HANDLERS[msg?.type];
+  if (popupHandler) {
+    Promise.resolve(popupHandler(msg.args || msg)).then(reply);
+    return true; // 异步 sendResponse
+  }
+  if (msg.type === 'record:getState') {
+    reply(recordingState(msg.tabId ?? msg.args?.tabId));
+    return false;
+  }
   if (msg.type === 'getStatus') {
     reply({
       connected: ws?.readyState === WebSocket.OPEN,
