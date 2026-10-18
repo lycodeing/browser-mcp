@@ -10,7 +10,7 @@ import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
-import { invokeTool, sendToExtension, isConnected, getExtensionInfo, reloadExtension } from './bridge.js';
+import { invokeTool, sendToExtension, isConnected, getExtensionInfo, reloadExtension, onExtensionRequest } from './bridge.js';
 import * as flowsStore from './flows-store.js';
 import * as gifComposer from './gif-composer.js';
 import {
@@ -460,7 +460,7 @@ const SHAPE_REFINEMENTS = {
 export function buildMcpServer() {
   const server = new McpServer({
     name: 'browser-mcp',
-    version: '2.3.0',
+    version: '2.4.0',
   });
 
   for (const [name, schema] of Object.entries(SCHEMAS)) {
@@ -780,6 +780,14 @@ export function startMcpServer(port = 3000) {
   const app = express();
   // 启动时异步清理过期的 spill 落盘图（超过 1 小时），失败不影响服务
   cleanupSpillFiles().catch(() => {});
+
+  // 扩展主动请求：popup 的 record_list / record_run 需要拉 flows 目录的数据，
+  // 通过 {id, method:'flow/*'} 消息直接发给 relay，由这里回执。
+  onExtensionRequest('flow/list', async () => ({ flows: await flowsStore.listFlows() }));
+  onExtensionRequest('flow/load', async ({ name }) => {
+    if (!name) throw new Error('flow/load requires params.name');
+    return { flow: await flowsStore.loadFlow(name) };
+  });
   // intercept_add 的 bodyBase64 上限 1 MB（解码后），base64 后约 1.4 MB，再经 JSON 包装需留余量；
   // 默认 100 KB 会让大二进制 Mock 直接 413。network_detail 的响应体也走同一通道。
   app.use(express.json({ limit: '8mb' }));
@@ -789,7 +797,7 @@ export function startMcpServer(port = 3000) {
     const info = getExtensionInfo();
     res.json({
       service: 'browser-mcp-relay',
-      version: '2.3.0',
+      version: '2.4.0',
       extension: info,
     });
   });

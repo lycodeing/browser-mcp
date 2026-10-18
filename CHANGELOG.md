@@ -2,6 +2,32 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。工具数量与接口以 README 为准。
 
+## [2.4.0] — 2026-10-19
+
+新增「操作录制 + GIF 动图导出」功能，面向京东运营等非技术用户的重复性任务自动化。
+
+### 新增（7 个工具）
+- `record_start` / `record_stop`：开始/结束录制，捕获 click、input、导航键、URL 变化等事件。`record_stop` 给 `name` 自动保存到 `~/.browser-mcp/flows/<name>.json`，同时合成 GIF 动图（`captureGif:false` 可关闭）
+- `record_list` / `record_delete`：列出/删除已保存的流程
+- `record_run`：按名回放，支持 `strict`（默认 true，单步失败即停）与 `stepDelayMs`（默认 300ms 节流）
+- `record_export_gif` / `record_export_json`：单独导出 GIF 或 JSON 到自定义路径
+
+### 新增（扩展 popup）
+- popup 升级为三 tab 面板：状态 / 录制 / 流程。运营不打开 AI 客户端也能点插件图标开始录制、看录制进度、管理已保存流程
+- 录制 tab：红点脉冲提示 + 已捕获步数 + 流程名输入框 + GIF 导出开关
+- 流程 tab：每个流程一行卡片，显示步骤数、GIF 大小、录制时间，一键回放/查看 GIF/删除
+
+### 实现要点
+- **target 多路兜底定位**：录制时同时捕获 text / ariaLabel / placeholder / role / tag / cssPath，回放按 text → aria/placeholder → role+tag → cssPath 顺序匹配，页面改版也能活
+- **事件驱动截图**：每个事件步骤触发一帧截图（960px JPEG 质量 70），点击前注入 2 秒消失的红圈高亮，帧与步骤天然对齐，体积比定时截屏小 90%
+- **GIF 编码**：`gif-encoder-2` + `jimp` 纯 JS 方案跑在 Relay，无原生编译依赖；帧间隔钳制 200-1500ms，输出超 3MB 自动降到 720px 宽重试
+- **自动插入 wait_for**：URL 变化后自动补 `navigate + wait_for network_idle`，点击后 DOM 变化自动补 `wait_for element`，回放稳定
+- **密码脱敏**：录制时 `input[type=password]` 的 value 自动替换为 `<REDACTED>`，回放前由 AI 问用户
+- **input 防抖**：连续输入 300ms 内合并为一步，只记最终值
+
+### 修复
+- relay 现在能应答扩展主动发起的 `flow/list` / `flow/load` 请求（popup 与 MCP 工具拉流程数据的通道）
+
 ## [2.3.0] — 2026-10-18
 
 ### 变更（破坏性）

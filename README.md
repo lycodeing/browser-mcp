@@ -6,13 +6,13 @@
 
 **让 AI 助手直接操控你正在用的 Chrome。**
 
-一个 Chrome 扩展 + 本地 MCP Relay，把浏览器能力以 37 个工具的形式提供给 ZCode、Claude Code、pi 等任何支持 MCP 的客户端。
+一个 Chrome 扩展 + 本地 MCP Relay，把浏览器能力以 44 个工具的形式提供给 ZCode、Claude Code、pi 等任何支持 MCP 的客户端。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white)
 ![Chrome MV3](https://img.shields.io/badge/Chrome-Manifest%20V3-4285F4?logo=googlechrome&logoColor=white)
 ![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-8A2BE2)
-![Tools](https://img.shields.io/badge/tools-37-orange)
+![Tools](https://img.shields.io/badge/tools-44-orange)
 
 [GitHub](https://github.com/lycodeing/browser-mcp) · [Gitee 镜像](https://gitee.com/lycodeing/browser-mcp)
 
@@ -29,6 +29,7 @@
 - **宽松入参**：模型把数字、布尔、坐标写成字符串（`"123"`、`"[601, 385]"`）也能正常调用。
 - **多 agent 并发**：多个 agent 同时操作不同标签页互不干扰；同一标签页上的写操作（点击、输入、导航等）自动排队，读操作不排队。`tab_group` 工具让每个 agent 的标签页归入自己的彩色标签组，一眼看出谁在用哪个页面。
 - **iframe 与 Shadow DOM**：`read_page`、`find`、`form_input`、`computer`、`get_page_text`、`file_upload` 自动覆盖所有 frame 并进入 open shadow root，子 frame 的 ref 带前缀（如 `f3.ref_7`），调用方式不变；`javascript_tool`、`get_page_text` 也可用 `frameId` 定向到某个 iframe。
+- **操作录制与回放**：点插件图标或对 AI 说"开始录"，在浏览器里正常操作一遍，停止后自动保存为 JSON 流程和 GIF 动图。之后说"跑一下「下载商品主图」"就能回放，不用模型重新推理每个元素在哪。适合京东运营等非技术用户的日常重复任务。
 
 ## 工作原理
 
@@ -45,7 +46,23 @@ Relay 对 AI 一侧暴露 MCP 端点，对浏览器一侧运行 WebSocket 服务
 
 ## 功能一览
 
-37 个工具，按用途分四组。
+44 个工具，按用途分五组。
+
+### 操作录制（V2.4 新增）
+
+录制浏览器操作、保存为流程、随时回放，同时导出 GIF 动图。面向京东运营等非技术用户的重复性任务自动化。
+
+| 工具 | 功能 |
+|------|------|
+| `record_start` | 开始录制。`captureGif` 默认 true，同步截图用于 GIF 导出 |
+| `record_stop` | 停止录制。给 `name` 自动保存到 `~/.browser-mcp/flows/<name>.json` 并合成 GIF；返回步骤 JSON 预览 |
+| `record_list` | 列出所有已保存的流程（名字、步骤数、GIF 大小、录制时间） |
+| `record_run` | 按名回放。`strict` 默认 true（单步失败即停）；`stepDelayMs` 默认 300（节流避免反爬） |
+| `record_delete` | 删除流程（同时删 .json 和 .gif） |
+| `record_export_gif` | 单独导出 GIF 到自定义路径（文件丢失或要重新出） |
+| `record_export_json` | 单独导出 JSON 到自定义路径 |
+
+**录制原理**：内容脚本在捕获阶段拦截 click / input / key / navigate 事件，每个事件提取 target 的 text / ariaLabel / placeholder / role / tag / cssPath 五套标识；回放按 text → aria → role+tag → cssPath 顺序兜底匹配，页面改版也能活。GIF 帧是事件触发的截图（点击前注入 2 秒红圈高亮），帧与步骤天然对齐。
 
 ### 页面交互与读取
 
