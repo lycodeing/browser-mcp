@@ -862,6 +862,26 @@ async function toolDownloads(args) {
   } catch (e) { return err(e.message); }
 }
 
+// ── state：一次性只读快照 ─────────────────────────────────────────────────────
+// 模型只需要"现在在哪个页面、有没有弹窗/错误"这类定位信息时，用一次调用替代
+// tabs_list + read_console_messages + network_list 的组合探查，省往返与 token。
+async function toolState() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
+  if (!tab) return err('No active tab in the current window');
+  const tabId = tab.id;
+  const buf = tabBuf(tabId);
+  return ok([{ type: 'text', text: JSON.stringify({
+    activeTabId: tabId,
+    url: tab.url || '',
+    title: tab.title || '',
+    frames: frameContexts.get(tabId)?.length ?? 0,
+    pendingDialogs: (buf.dialogs || []).filter(d => !d.answered).length,
+    networkBuffered: buf.network.size(),
+    consoleErrors: buf.console.filter(m => m.type === 'error').length,
+    interceptRules: interceptStore.isActive(tabId),
+  }) }]);
+}
+
 // ── performance / emulate ─────────────────────────────────────────────────────
 // tabId -> { events, truncated, resolve }  (Tracing.* 事件由 chrome.debugger.onEvent 填充)
 const traceSessions = new Map();
@@ -1091,6 +1111,7 @@ const TOOL_MAP = {
   intercept_add: intercept.intercept_add, intercept_list: intercept.intercept_list, intercept_remove: intercept.intercept_remove,
   wait_for: toolWaitFor, handle_dialog: toolHandleDialog, save_pdf: toolSavePdf,
   cookies: toolCookies, downloads: toolDownloads,
+  state: toolState,
 };
 
 // wait_for/downloads 的长超时工具放宽 WS 层兜底（relay 侧另有逐工具超时）

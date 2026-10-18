@@ -37,11 +37,11 @@ test('公布的 schema 对数字/布尔/数组同时放行字符串形式', asyn
   }
 });
 
-test('工具清单恰好 33 个，旧工具已删除，新工具已就位', async () => {
+test('工具清单恰好 34 个，旧工具已删除，新工具已就位', async () => {
   const client = await connectClient();
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name);
-  assert.equal(names.length, 33);
+  assert.equal(names.length, 34);
   for (const old of ['tabs_context', 'tabs_create', 'tabs_close', 'read_network_requests', 'tabs', 'network']) {
     assert.ok(!names.includes(old), `${old} 应被删除`);
   }
@@ -50,6 +50,7 @@ test('工具清单恰好 33 个，旧工具已删除，新工具已就位', asyn
     'tabs_list', 'tab_create', 'tab_close', 'tab_activate',
     'tab_reload', 'tab_duplicate', 'tab_group',
     'screenshot', 'click', 'sleep',
+    'state',
     'storage',
   ]) {
     assert.ok(names.includes(name), `${name} 应存在`);
@@ -57,6 +58,16 @@ test('工具清单恰好 33 个，旧工具已删除，新工具已就位', asyn
   for (const name of ['intercept_add', 'intercept_list', 'intercept_remove']) {
     assert.ok(names.includes(name), `${name} 应存在`);
   }
+});
+
+test('state 工具无必填参数且 description 指向快照语义', async () => {
+  const client = await connectClient();
+  const { tools } = await client.listTools();
+  const state = tools.find((t) => t.name === 'state');
+  assert.ok(state, 'state 工具应存在');
+  assert.equal(Object.keys(state.inputSchema.properties || {}).length, 0);
+  assert.match(state.description, /snapshot/i);
+  assert.match(state.description, /tabs_list/);
 });
 
 test('intercept_add 的数字参数放行字符串形式并还原为原生类型', async () => {

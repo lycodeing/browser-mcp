@@ -35,11 +35,13 @@ test('非排队工具的超时不受排队等待影响', () => {
   assert.equal(TOOL_TIMEOUTS.save_pdf, 60000);
   assert.equal(TOOL_TIMEOUTS.performance, 60000);
   assert.equal(TOOL_TIMEOUTS.emulate, 10000);
+  // state 是轻量只读快照，不排队
+  assert.equal(TOOL_TIMEOUTS.state, 5000);
 });
 
 test('超时表覆盖全部工具且不含旧工具名', () => {
   const names = Object.keys(TOOL_TIMEOUTS).sort();
-  assert.equal(names.length, 33);
+  assert.equal(names.length, 34);
   for (const old of ['tabs_context', 'tabs_create', 'tabs_close', 'read_network_requests', 'tabs', 'network']) {
     assert.ok(!names.includes(old), `${old} 应被删除`);
   }

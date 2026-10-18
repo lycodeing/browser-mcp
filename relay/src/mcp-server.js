@@ -80,8 +80,8 @@ const SCHEMAS = {
     format: z.enum(['jpeg', 'webp', 'png']).optional().describe('Screenshot format, default jpeg'),
     fullPage: bool().optional().describe('Capture beyond viewport (screenshot only)'),
     maxDimension: num(z.number().int().min(400).max(8000)).optional().describe('Longest edge of the returned image in px, default 1280. Image tokens scale with pixel count, so keep it small; coordinates you pass back are in this image\'s pixels'),
-    saveTo: z.string().optional().describe('Absolute local path to save screenshot/PDF; returns path instead of full image on disk'),
-    returnImage: bool().optional().describe('With saveTo: false to skip returning image data'),
+    saveTo: z.string().optional().describe('Absolute local path to save screenshot/PDF; returns path instead of full image on disk. When saveTo is set, image is dropped from context unless returnImage:true is explicitly passed'),
+    returnImage: bool().optional().describe('With saveTo: false to skip returning image data; explicit true keeps the image in context even when saved to disk'),
     dialog: z.enum(['accept', 'dismiss', 'manual']).optional()
       .describe('JS dialog policy during this action: auto-accept (default), auto-dismiss, or manual via handle_dialog'),
   },
@@ -310,6 +310,7 @@ const SCHEMAS = {
     tabId: lenientTabId(),
     ruleId: z.string().optional().describe('Rule id from intercept_list; omit to remove all rules and turn interception off'),
   },
+  state: {},
 };
 
 // ─── Tool descriptions ────────────────────────────────────────────────────────
@@ -348,6 +349,7 @@ const DESCRIPTIONS = {
   intercept_list: 'List the intercept rules on a tab with their hit counts and whether interception is currently active.',
   intercept_remove: 'Remove one intercept rule by id, or all rules on the tab (omit ruleId), which also turns interception off.',
   storage: 'Read and write localStorage / sessionStorage of the tab\'s main frame, or summarize IndexedDB. Actions: list (keys with size and a short preview), get (one value, truncated at maxChars), set / remove / clear (writes), idb (read-only summary of databases, object stores and record counts; record contents are never read). Works on the top-level frame\'s origin only, not on iframes; the first line of every result shows the origin. Values are not masked, treat them like cookies.',
+  state: 'Get a one-shot snapshot of the current browser state: active tab id/url/title, frame count, pending dialogs, buffered network requests, console error count, active intercept rules. Use this instead of tabs_list when you only need orientation.',
 };
 
 // ─── Per-tool timeout (ms) ────────────────────────────────────────────────────
@@ -373,6 +375,7 @@ const BASE_TIMEOUTS = {
   cookies: 10000, downloads: 610000,
   performance: 60000, emulate: 10000, storage: 10000,
   intercept_add: 10000, intercept_list: 10000, intercept_remove: 10000,
+  state: 5000,
 };
 
 /** 会进扩展侧串行队列的工具；其超时叠加排队等待，避免排队期间被 relay 判超时 */
@@ -477,9 +480,11 @@ async function applySaveTo(args, result) {
 
   try {
     const size = await saveBase64(saveTo, result.content[idx].data);
-    // save_pdf 内容体积大且 agent 无法消费，强制移除；截图按 returnImage 决定
+    // save_pdf 内容体积大且 agent 无法消费，强制移除；截图默认不回图（省 token），
+    // 只有显式 returnImage:true 才保留；returnImage:false 与非图 mime 也移除
     const dropImage = !result.content[idx].mimeType?.startsWith('image/')
-      || args.returnImage === false;
+      || args.returnImage === false
+      || (args.saveTo && args.returnImage === undefined);
     if (dropImage) result.content.splice(idx, 1);
     const textItem = result.content.find((c) => c.type === 'text');
     const saved = `Saved to ${saveTo} (${formatSize(size)})`;
@@ -503,7 +508,26 @@ async function applySaveTo(args, result) {
 
 const INLINE_IMAGE_MAX_BYTES = 1_000_000;
 const SPILL_DIR = path.join(os.tmpdir(), 'browser-mcp');
+const SPILL_MAX_AGE_MS = 60 * 60 * 1000;
 const MIME_EXT = { 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/png': 'png' };
+
+/**
+ * 启动时清理 SPILL_DIR 里 mtime 超过 1 小时的落盘图片。
+ * 纯节流性质：失败静默，不阻塞也不影响启动。
+ */
+async function cleanupSpillFiles() {
+  try {
+    const names = await fsp.readdir(SPILL_DIR);
+    const now = Date.now();
+    for (const name of names) {
+      const file = path.join(SPILL_DIR, name);
+      try {
+        const st = await fsp.stat(file);
+        if (st.mtimeMs < now - SPILL_MAX_AGE_MS) await fsp.unlink(file);
+      } catch { /* 单文件失败跳过即可 */ }
+    }
+  } catch { /* 目录不存在等情况直接放过 */ }
+}
 
 async function spillLargeImages(result) {
   if (!result?.content) return result;
@@ -575,6 +599,8 @@ async function relay(tool, args) {
 
 export function startMcpServer(port = 3000) {
   const app = express();
+  // 启动时异步清理过期的 spill 落盘图（超过 1 小时），失败不影响服务
+  cleanupSpillFiles().catch(() => {});
   // intercept_add 的 bodyBase64 上限 1 MB（解码后），base64 后约 1.4 MB，再经 JSON 包装需留余量；
   // 默认 100 KB 会让大二进制 Mock 直接 413。network_detail 的响应体也走同一通道。
   app.use(express.json({ limit: '8mb' }));
