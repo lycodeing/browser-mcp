@@ -102,3 +102,30 @@ export function invokeTool(tool, args, timeoutMs = 60000) {
     }
   });
 }
+
+/**
+ * 让扩展重新加载自身（chrome.runtime.reload）。开发期改完扩展代码后用它生效，
+ * 免去手动点 chrome://extensions 的重载按钮（那条路的自动化点击实测不可靠）。
+ * 回执在重启前发出，所以这里通常能拿到结果；连接随后会短暂断开再重连。
+ */
+export function reloadExtension(timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    if (!isConnected()) {
+      reject(new Error('No extension connected. Make sure the Chrome extension is running and connected.'));
+      return;
+    }
+    const id = nextMessageId++;
+    const timer = setTimeout(() => {
+      pendingRequests.delete(id);
+      reject(new Error(`Extension reload timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    pendingRequests.set(id, { resolve, reject, timer, tool: 'extension/reload' });
+    try {
+      extensionWs.send(JSON.stringify({ id, method: 'extension/reload' }));
+    } catch (err) {
+      pendingRequests.delete(id);
+      clearTimeout(timer);
+      reject(err);
+    }
+  });
+}

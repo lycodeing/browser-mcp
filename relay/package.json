@@ -1,6 +1,6 @@
 {
   "name": "browser-mcp-relay",
-  "version": "2.2.2",
+  "version": "2.2.3",
   "description": "Browser automation MCP relay for ZCode / Claude Code",
   "license": "MIT",
   "type": "module",

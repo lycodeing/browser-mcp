@@ -10,7 +10,7 @@ import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
-import { invokeTool, isConnected, getExtensionInfo } from './bridge.js';
+import { invokeTool, isConnected, getExtensionInfo, reloadExtension } from './bridge.js';
 import {
   lenientNumber as num, lenientBoolean as bool, lenientNumberTuple, lenientNumberArray,
 } from './schema-helpers.js';
@@ -330,7 +330,7 @@ export const TOOL_TIMEOUTS = Object.fromEntries(
 export function buildMcpServer() {
   const server = new McpServer({
     name: 'browser-mcp',
-    version: '2.2.2',
+    version: '2.2.3',
   });
 
   for (const [name, schema] of Object.entries(SCHEMAS)) {
@@ -497,16 +497,29 @@ async function relay(tool, args) {
 
 export function startMcpServer(port = 3000) {
   const app = express();
-  app.use(express.json());
+  // intercept_add 的 bodyBase64 上限 1 MB（解码后），base64 后约 1.4 MB，再经 JSON 包装需留余量；
+  // 默认 100 KB 会让大二进制 Mock 直接 413。network detail 的响应体也走同一通道。
+  app.use(express.json({ limit: '8mb' }));
 
   // Status endpoint
   app.get('/', (_req, res) => {
     const info = getExtensionInfo();
     res.json({
       service: 'browser-mcp-relay',
-      version: '2.2.2',
+      version: '2.2.3',
       extension: info,
     });
+  });
+
+  // 开发期自助重载扩展：改完 extension/ 下的代码后 POST 这里即可，无需手动点按钮。
+  // 返回后扩展会短暂断开再自动重连，稍等片刻即可在新版本上继续调用。
+  app.post('/reload', async (_req, res) => {
+    try {
+      const result = await reloadExtension();
+      res.json({ ok: true, result });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
   });
 
   // MCP endpoint — stateless: 每次请求创建独立的 server + transport
