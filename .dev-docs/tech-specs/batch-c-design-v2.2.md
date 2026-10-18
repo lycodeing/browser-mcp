@@ -177,6 +177,23 @@ triggerRef 路径：点击坐标复用 `getElemCoords`（A 批跨域握手，主
 
 结论：**改扩展代码后需要用户手动到 chrome://extensions 点一次"重新加载"**。后续批次如需频繁迭代扩展，考虑加一个 `chrome.runtime.reload()` 的管理动作（它自身也要先手动重载一次才生效，属一次性成本）。
 
+## 7.6 手测发现的缺陷与修复（v2.2.3）
+
+拿到 2.2.2 扩展后跑手测清单，暴露 4 个真实缺陷并全部修复：
+
+| # | 缺陷 | 根因 | 修复 |
+|---|------|------|------|
+| 1 | `javascript_tool` 在所有声明 CSP 的页面上完全失效 | C 批搬迁时把页面 eval 的错误从 `throw`（会触发 CDP 回退）改成 `return err`，切断了绕过 CSP 的唯一通路 | 改以 CDP `Runtime.evaluate` 为主路径（调试协议求值不受页面 CSP 约束），主 frame 用默认上下文，子 frame 用跟踪到的主世界上下文 |
+| 2 | 子 frame 的 `javascript_tool` 报 Frame not found | `frameContexts` 的 key 是 CDP 字符串 frameId，而 ref 前缀的 `f<N>` 是 chrome.scripting 的数字 id，**两套体系缺映射** | 新增 `flattenFrameTree` + `buildFrameIdMap`（按 URL+window.name 配对），`toCdpFrameId` 换算 |
+| 3 | `file_upload` 子 frame 报 "DOM agent is not enabled" / 定位不到 | 新写的 `DOM.performSearch` 路径既缺 `DOM.enable`，也受主 frame DOM 域限制 | 改为在目标 frame 的上下文里用 `Runtime.evaluate` 取元素 `objectId`，再 `DOM.setFileInputFiles({objectId})`——天然支持子 frame |
+| 4 | ~1 MB 的 `bodyBase64` 报 HTTP 413 | `express.json()` 默认 100 KB 上限 | 提到 `8mb` |
+| 5 | 多语句片段（如 `a(); b();`）报 SyntaxError | 搬迁时删掉了旧实现的"表达式失败→async IIFE 重试" | 补回语法错重试 |
+
+同时新增**自助重载通道**：`POST http://127.0.0.1:3000/reload` → relay 发 `extension/reload` → 扩展 `chrome.runtime.reload()`。
+这根治了 7.5 记录的重载阻塞。附注：若仍需手动重载，`chrome://extensions` 的按钮**只能用键盘激活**（Tab 聚焦到"重新加载"后按空格）——鼠标点击（System Events / HID / cliclick）在本机 Chrome 155 上全部无效，键盘激活则一次成功。
+
+手测结论（v2.2.3，全部通过）：`javascript_tool` 主/子 frame 与语句/表达式/多语句均正常；`file_upload` 子 frame 设文件后目标 frame 的 change 事件真实触发（`CHANGED:big.png/792793`）；`get_page_text` 三模式正确；792793 B 的 PNG 经 `bodyBase64` Mock 出图 `IMG=1200x660`；带凭据跨域 Mock 拿到 `CORS=ok:200:{"mock":true}`（改前为 `InvalidAllowCredentials`）；`find`/`storage`/`computer`/`network` 抽查无回归。
+
 ## 8. 提交与文档
 
 - 分文件提交：① 扩展实现（lib/tools/background）② 扩展测试 ③ relay schema+版本 ④ 文档（README + 示意图更新 + 本文档 + B 批文档修正）。

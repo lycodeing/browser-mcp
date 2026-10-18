@@ -285,6 +285,9 @@ browser-mcp/
 **工具调用返回 "No extension connected"**
 在 `chrome://extensions` 里点击扩展的刷新按钮，或重新加载扩展。
 
+**改完 `extension/` 下的代码，怎么让它生效**
+`curl -X POST http://127.0.0.1:3000/reload` 即可让扩展重新加载自身，几秒后自动重连（`GET /` 里 `extension.version` 会变成新版本号）。不必手动去 `chrome://extensions` 点按钮。
+
 **tabId 相关报错**
 `tabId` 是 Chrome 的数字标签页 id（形如 `1924551535`），只能通过 `tabs`（`action:"list"`）获取，不能是 UUID、标签标题或猜测的短编号。传错时校验错误会直接提示正确取法；id 不存在时错误会附上当前打开的标签页列表，方便直接改用正确的 id。
 
