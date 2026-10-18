@@ -35,6 +35,9 @@ const tabEventBuffers = new Map();
 const cdpReady = new Set();
 // tabId -> 'accept' | 'dismiss' | 'manual' (JS dialog policy, set during a tool call)
 const dialogModes = new Map();
+// tabId -> [{ id, frameId, isDefault, name }]，来自 Runtime.executionContext* 事件；
+// 供 javascript_tool 在子 frame 里定位主世界上下文（页面 CSP 会拦 eval，CDP 求值不受限）
+const frameContexts = new Map();
 
 // ── WebSocket connection ──────────────────────────────────────────────────────
 function connect() {
@@ -1072,7 +1075,7 @@ async function toolPerformance(args) {
 const toolEmulate = createEmulateTool({ chrome, ok, err, ensureCdp, emulatedTabs, networkPresets: NETWORK_PRESETS });
 
 const { toolJavascript, toolGetPageText, toolFileUpload } = createPageTools({
-  chrome, ok, err, ensureCdp, ensureCs, runInRefFrame, getElemCoords, sleep,
+  chrome, ok, err, ensureCdp, ensureCs, runInRefFrame, getElemCoords, sleep, frameContexts,
 });
 
 const TOOL_MAP = {
@@ -1118,6 +1121,14 @@ async function handleMessage(raw) {
   if (msg.method === 'tools/discover') {
     sendMsg({id:msg.id, result:{tools:Object.keys(TOOL_MAP).map(name=>({name}))}}); return;
   }
+  // 开发期自重启：磁盘上的扩展代码更新后，靠这个通道让 Chrome 重新加载本扩展，
+  // 不必再让用户手动去 chrome://extensions 点按钮（自动化点击实测不可靠）。
+  // 先回执再重启，避免调用方拿到连接被切断的报错。
+  if (msg.method === 'extension/reload') {
+    sendMsg({id:msg.id, result:{content:[{type:'text',text:'Reloading extension; it will reconnect to the relay in a moment.'}]}});
+    setTimeout(() => { try { chrome.runtime.reload(); } catch {} }, 100);
+    return;
+  }
   if (msg.method === 'tools/invoke' && typeof msg.id === 'number') {
     const tool = msg.params?.tool;
     const args = msg.params?.arguments ?? {};
@@ -1139,6 +1150,27 @@ async function handleMessage(raw) {
 chrome.debugger.onEvent.addListener((src, method, params) => {
   const tabId = src.tabId; if (!tabId) return;
   if (method === 'Fetch.requestPaused') { intercept.handlePaused(tabId, params); return; }
+  // 子 frame 的 JS 求值需要它的主世界上下文 id；Runtime.enable 后 CDP 会持续推送
+  if (method === 'Runtime.executionContextCreated') {
+    const c = params.context ?? {};
+    const frameId = c.auxData?.frameId;
+    if (frameId === undefined) return;
+    let list = frameContexts.get(tabId);
+    if (!list) { list = []; frameContexts.set(tabId, list); }
+    const entry = { id: c.id, frameId, isDefault: c.auxData?.isDefault === true, name: c.name || '' };
+    const i = list.findIndex((x) => x.id === c.id);
+    if (i >= 0) list[i] = entry; else list.push(entry);
+    return;
+  }
+  if (method === 'Runtime.executionContextDestroyed') {
+    const list = frameContexts.get(tabId);
+    if (!list) return;
+    const i = list.findIndex((x) => x.id === params.executionContextId);
+    if (i >= 0) list.splice(i, 1);
+    if (!list.length) frameContexts.delete(tabId);
+    return;
+  }
+  if (method === 'Runtime.executionContextsCleared') { frameContexts.delete(tabId); return; }
   if (method.startsWith('Tracing.')) {
     const trace = traceSessions.get(tabId);
     if (!trace) return;
@@ -1185,6 +1217,7 @@ chrome.debugger.onEvent.addListener((src, method, params) => {
 chrome.debugger.onDetach.addListener(src => {
   if (src.tabId) {
     cdpReady.delete(src.tabId); traceSessions.delete(src.tabId); emulatedTabs.delete(src.tabId);
+    frameContexts.delete(src.tabId);
     intercept.handleDetach(src.tabId);
   }
 });
@@ -1197,6 +1230,7 @@ chrome.tabs.onRemoved.addListener(tabId => {
   tabEventBuffers.delete(tabId);
   shotScale.delete(tabId);
   cdpReady.delete(tabId);
+  frameContexts.delete(tabId);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, info) => {

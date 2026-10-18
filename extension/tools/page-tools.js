@@ -2,72 +2,88 @@
 // 依赖（chrome、ok、err、ensureCdp、ensureCs、parseRef、runInRefFrame、collectFrameInfos、resolveFrameOffset、toTopPoint、sleep）
 // 通过参数注入；坐标换算复用 A 批的跨 frame 握手（getElemCoords 由 background 传入）。
 
-import { formatJsResult, truncateResult, MAX_CODE_CHARS } from '../lib/js-tool.js';
+import { formatJsResult, truncateResult, MAX_CODE_CHARS, wrapExpression, pickContextId } from '../lib/js-tool.js';
 import { mergeFrameTexts, formatSingleFrameText } from '../lib/page-text.js';
-import { parseRef } from '../lib/frames.js';
+import { parseRef, flattenFrameTree, buildFrameIdMap } from '../lib/frames.js';
 
-export function createPageTools({ chrome, ok, err, ensureCdp, ensureCs, runInRefFrame, getElemCoords, sleep }) {
+export function createPageTools({ chrome, ok, err, ensureCdp, ensureCs, runInRefFrame, getElemCoords, sleep, frameContexts }) {
   const send = (tabId, method, params) => chrome.debugger.sendCommand({ tabId }, method, params);
 
   const frameNotFound = (frameId) =>
     `Frame f${frameId} not found on this tab. The page may have navigated; run read_page or find again to get current frame refs.`;
 
-  // ── javascript_tool ──────────────────────────────────────────────────────────
-  // 页面函数与旧实现同构：语句关键字探测 + 表达式包装，省一次失败 eval。
-  // 经 executeScript 序列化注入，必须自包含。
-  const JS_PAGE_FUNC = (code) => {
-    const isStmt = /^(const|let|var|function|class|if|for|while|switch|try|throw|return|do|export|import)\b/.test(code.trim());
-    try {
-      if (!isStmt) return { ok: true, v: (0, eval)(`(${code})`) };
-      (0, eval)(code); return { ok: true, v: undefined };
-    } catch (e) { return { ok: false, e: e.message }; }
-  };
+  /**
+   * 数字 frameId（ref 前缀用的 chrome.scripting 体系）→ CDP frameId（字符串体系）。
+   * 两套 id 互不相通：Runtime 执行上下文与 Page/DOM 命令只认 CDP 的。
+   * 用「各 frame 的 location.href + window.name」与 Page.getFrameTree 配对。
+   * 主 frame 固定为主树根，返回 null 表示找不到该 frame。
+   */
+  async function toCdpFrameId(tabId, frameId) {
+    const { frameTree } = await send(tabId, 'Page.getFrameTree');
+    if (frameId === 0) return frameTree?.frame?.id ?? null;
+    const cdpFrames = flattenFrameTree(frameTree);
+    const injected = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => ({ url: location.href, name: window.name || '' }),
+    }).catch(() => []);
+    const extFrames = injected.filter((r) => r.result).map((r) => ({ frameId: r.frameId, ...r.result }));
+    return buildFrameIdMap(extFrames, cdpFrames).get(frameId) ?? null;
+  }
 
+  /**
+   * 取某个 CDP frame 的主世界执行上下文 id（用于在该 frame 里跑 JS / 解析 DOM）。
+   * 优先用 Runtime.executionContext* 跟踪到的主世界上下文；没有则为该 frame 开一个隔离世界。
+   * 隔离世界与页面世界隔离，读不到页面变量，但 DOM 是共享的（元素、属性可见）。
+   */
+  async function contextForFrame(tabId, cdpFrameId) {
+    const known = pickContextId(frameContexts.get(tabId) ?? [], cdpFrameId);
+    if (known != null) return known;
+    try {
+      const world = await send(tabId, 'Page.createIsolatedWorld', { frameId: cdpFrameId, grantUniveralAccess: false });
+      return world?.executionContextId ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  // ── javascript_tool ──────────────────────────────────────────────────────────
+  // 走 CDP Runtime.evaluate 而非 content script 注入：页面自己声明 CSP 时
+  // executeScript 内的 eval 会被 script-src 拦下（'unsafe-eval' 不在白名单），
+  // 而调试协议的求值不受页面 CSP 约束——DevTools 控制台同款通道。
+  // 主 frame 省略 contextId 用默认上下文；子 frame 用跟踪到的该 frame 主世界上下文。
   async function toolJavascript(args) {
     const { tabId, text } = args;
     if (!tabId) return err('tabId required');
     if (!text) return err('text required');
     if (text.length > MAX_CODE_CHARS) return err(`Code too long (max ${MAX_CODE_CHARS} chars)`);
-    const frameId = Number.isInteger(args.frameId) ? args.frameId : 0;
     if (args.frameId !== undefined && !Number.isInteger(args.frameId)) return err('frameId must be an integer');
+    const frameId = Number.isInteger(args.frameId) ? args.frameId : 0;
     await ensureCdp(tabId);
 
-    // 主路径：scripting API 定向到目标 frame
-    try {
-      const results = await chrome.scripting.executeScript({
-        target: { tabId, frameIds: [frameId] },
-        func: JS_PAGE_FUNC,
-        args: [text],
-      });
-      const res = results[0]?.result;
-      if (!res) return err(frameNotFound(frameId));
-      // 页面 eval 的错误直接透传；兜底只服务"注入本身被拒"的场景
-      if (res.ok === false) return err(res.e);
-      return ok([{ type: 'text', text: truncateResult(formatJsResult(res.v)) }]);
-    } catch (e) {
-      if (e instanceof RangeError || /frame/i.test(e.message || '')) return err(frameNotFound(frameId));
-      // CDP 兜底：受限页面 executeScript 被拒时走 isolated world。
-      // isolated world 与页面世界隔离，读不到页面变量——仅作兜底，已知限制。
-      let contextId;
-      try {
-        const world = await send(tabId, 'Page.createIsolatedWorld', { frameId });
-        contextId = world?.executionContextId;
-      } catch { /* 旧的通用报错路径 */ }
-      if (contextId == null) throw e;
-      const cdpRes = await send(tabId, 'Runtime.evaluate',
-        { expression: `(${text})`, returnByValue: true, awaitPromise: true, contextId });
-      if (cdpRes.exceptionDetails) {
-        const msg = cdpRes.exceptionDetails.exception?.description || cdpRes.exceptionDetails.text;
-        if (/SyntaxError/.test(msg)) {
-          const stmtRes = await send(tabId, 'Runtime.evaluate',
-            { expression: `(async function(){${text}})()`, returnByValue: true, awaitPromise: true, contextId });
-          if (stmtRes.exceptionDetails) throw new Error(stmtRes.exceptionDetails.exception?.description || 'JS error');
-          return ok([{ type: 'text', text: formatJsResult(stmtRes.result?.value) }]);
-        }
-        throw new Error(msg);
-      }
-      return ok([{ type: 'text', text: formatJsResult(cdpRes.result?.value) }]);
+    let contextId;
+    if (frameId !== 0) {
+      const cdpFrameId = await toCdpFrameId(tabId, frameId);
+      if (cdpFrameId == null) return err(frameNotFound(frameId));
+      contextId = await contextForFrame(tabId, cdpFrameId);
+      if (contextId == null) return err(frameNotFound(frameId));
     }
+
+    const evalParams = { expression: wrapExpression(text), returnByValue: true, awaitPromise: true };
+    if (contextId !== undefined) evalParams.contextId = contextId;
+    let res = await send(tabId, 'Runtime.evaluate', evalParams);
+    // 多语句片段常不以语句关键字开头（如 "a(); b();"），按表达式解析会 SyntaxError。
+    // 与旧实现一致：语法错时改用 async IIFE 重试一次。
+    if (res?.exceptionDetails && /SyntaxError/.test(res.exceptionDetails.text || res.exceptionDetails.exception?.description || '')) {
+      res = await send(tabId, 'Runtime.evaluate', {
+        expression: `(async function(){${text}})()`, returnByValue: true, awaitPromise: true,
+        ...(contextId !== undefined ? { contextId } : {}),
+      });
+    }
+    if (res?.exceptionDetails) {
+      const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'JS error';
+      return err(msg);
+    }
+    return ok([{ type: 'text', text: truncateResult(formatJsResult(res?.result?.value)) }]);
   }
 
   // ── get_page_text ────────────────────────────────────────────────────────────
@@ -123,43 +139,48 @@ export function createPageTools({ chrome, ok, err, ensureCdp, ensureCs, runInRef
       const parsed = parseRef(ref);
       if (!parsed) return err(`Invalid ref: ${ref}. Run read_page or find to get a valid ref.`);
       await ensureCs(tabId);
-      // 目标 frame 里确认元素还在（runInRefFrame 对不存在的 frame 返回 undefined）
-      const present = await runInRefFrame(tabId, parsed,
+      const cdpFrameId = await toCdpFrameId(tabId, parsed.frameId);
+      if (cdpFrameId == null) return err(`Element not found: ${ref}. The frame may have navigated; run read_page or find again.`);
+
+      // 在目标 frame 的主世界上下文里把元素转成 CDP objectId；
+      // DOM.setFileInputFiles 认 objectId，天然支持子 frame（不受 DOM 域与主 frame 限制）。
+      let contextId = await contextForFrame(tabId, cdpFrameId);
+      // 元素引用只存在于内容脚本世界，取对象要在其所在上下文求值：
+      // __accessibilityTree 是内容脚本注入的，用 executeScript 在目标 frame 拿到 element，
+      // 再由 CDP 在该 frame 的上下文里按选择器重新解析。
+      const info = await runInRefFrame(tabId, parsed,
         (r) => {
           const el = globalThis.__accessibilityTree?.getElementByRef(r);
-          return el ? { tag: el.tagName } : null;
+          if (!el) return null;
+          const tag = el.tagName.toLowerCase();
+          if (tag !== 'input' || (el.getAttribute('type') || '').toLowerCase() !== 'file') {
+            return { tag, isFile: false };
+          }
+          el.setAttribute('data-bmcp-upload', '1');
+          return { tag, isFile: true };
         },
         [parsed.ref]);
-      if (!present) {
-        return err(`Element not found: ${ref}. The frame may have navigated; run read_page or find again.`);
-      }
-      if ((present.tag || '').toLowerCase() !== 'input') {
-        return err(`Element ${ref} is <${present.tag?.toLowerCase() || 'unknown'}>, not an input. Use a ref of input[type=file].`);
-      }
-      const token = `bmcp-${Date.now()}`;
-      await runInRefFrame(tabId, parsed,
-        (r, t, attr) => {
-          const el = globalThis.__accessibilityTree?.getElementByRef(r);
-          if (el) el.setAttribute(attr, t);
-        },
-        [parsed.ref, token, 'data-bmcp-token']);
-      let nodeId;
-      let searchId;
+      if (!info) return err(`Element not found: ${ref}. The frame may have navigated; run read_page or find again.`);
+      if (!info.isFile) return err(`Element ${ref} is <${info.tag}>, not an input[type=file].`);
+
       try {
-        const found = await send(tabId, 'DOM.performSearch',
-          { query: `input[type="file"][data-bmcp-token="${token}"]` });
-        searchId = found?.searchId;
-        if (found?.resultCount !== 1) return err(`Expected exactly 1 file input for ${ref}, found ${found?.resultCount ?? 0}`);
-        const res = await send(tabId, 'DOM.getSearchResults', { searchId, fromIndex: 0, toIndex: 1 });
-        nodeId = res?.nodeIds?.[0];
+        const evalParams = {
+          expression: 'document.querySelector("input[type=file][data-bmcp-upload]")',
+          returnByValue: false,
+        };
+        if (contextId != null) evalParams.contextId = contextId;
+        const found = await send(tabId, 'Runtime.evaluate', evalParams);
+        if (found?.exceptionDetails) {
+          return err(found.exceptionDetails.exception?.description || 'Failed to resolve the file input');
+        }
+        const objectId = found?.result?.objectId;
+        if (!objectId) return err(`Could not resolve file input ${ref} in its frame`);
+        await send(tabId, 'DOM.setFileInputFiles', { files: paths, objectId });
       } finally {
-        if (searchId !== undefined) await send(tabId, 'DOM.discardSearchResults', { searchId }).catch?.(() => {});
         await runInRefFrame(tabId, parsed,
-          (attr) => { document.querySelector(`[${attr}]`)?.removeAttribute(attr); },
-          ['data-bmcp-token']).catch(() => {});
+          () => { document.querySelector('[data-bmcp-upload]')?.removeAttribute('data-bmcp-upload'); },
+          []).catch(() => {});
       }
-      if (!nodeId) return err(`Could not locate file input for ${ref} in the DOM`);
-      await send(tabId, 'DOM.setFileInputFiles', { files: paths, nodeId });
       return ok([{ type: 'text', text: `File(s) set on input ${ref}: ${paths.join(', ')}` }]);
     }
 

@@ -136,3 +136,47 @@ export function toTopPoint(offset, point) {
 }
 
 export const MAX_MERGED_FRAMES = 30;
+
+// ── 两套 frame 标识的映射 ────────────────────────────────────────────────────
+// chrome.scripting 用数字 frameId（ref 前缀 f<N> 就是它），CDP 用不透明字符串 frameId
+// （Runtime 执行上下文、DOM 命令都认这个）。子 frame 的 JS 求值必须换算出 CDP id。
+
+/** Page.getFrameTree 的树拍平成 [{ id, url, name, parentId }]（前序，根在前） */
+export function flattenFrameTree(node, parentId, out = []) {
+  if (!node) return out;
+  const f = node.frame ?? node;
+  if (!f.id) return out;
+  out.push({ id: f.id, url: f.url ?? '', name: f.name ?? '', parentId });
+  for (const child of node.childFrames ?? []) flattenFrameTree(child, f.id, out);
+  return out;
+}
+
+/**
+ * 建立 数字 frameId → CDP frameId 的映射。
+ * extFrames: [{ frameId, url, name }]（来自 executeScript allFrames 读 location.href）
+ * cdpFrames: flattenFrameTree 的产物
+ * 先按 URL+window.name 精确配对，再按 URL，最后同 URL 多帧时按出现顺序补齐。
+ */
+export function buildFrameIdMap(extFrames, cdpFrames) {
+  const map = new Map();
+  const pool = [...cdpFrames];
+  const take = (pred) => {
+    const i = pool.findIndex(pred);
+    return i >= 0 ? pool.splice(i, 1)[0] : null;
+  };
+  for (const ef of extFrames) {
+    const hit = take((c) => c.url === ef.url && c.name === (ef.name ?? ''));
+    if (hit) map.set(ef.frameId, hit.id);
+  }
+  for (const ef of extFrames) {
+    if (map.has(ef.frameId)) continue;
+    const hit = take((c) => c.url === ef.url);
+    if (hit) map.set(ef.frameId, hit.id);
+  }
+  for (const ef of extFrames) {
+    if (map.has(ef.frameId)) continue;
+    const hit = pool.shift();
+    if (hit) map.set(ef.frameId, hit.id);
+  }
+  return map;
+}
