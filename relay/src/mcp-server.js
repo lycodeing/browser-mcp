@@ -10,7 +10,9 @@ import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
-import { invokeTool, isConnected, getExtensionInfo, reloadExtension } from './bridge.js';
+import { invokeTool, sendToExtension, isConnected, getExtensionInfo, reloadExtension } from './bridge.js';
+import * as flowsStore from './flows-store.js';
+import * as gifComposer from './gif-composer.js';
 import {
   lenientNumber as num, lenientBoolean as bool, lenientNumberTuple, lenientNumberArray,
 } from './schema-helpers.js';
@@ -322,6 +324,34 @@ const SCHEMAS = {
     tabId: lenientTabId(),
     ruleId: z.string().optional().describe('Rule id from intercept_list; omit to remove all rules and turn interception off'),
   },
+  // ─── 录制工具集：录制/回放/管理用户操作流程 ─────────────────────────────────
+  record_start: {
+    tabId: lenientTabId(),
+    captureGif: bool().optional().default(true).describe('同时截图用于 GIF 导出'),
+  },
+  record_stop: {
+    tabId: lenientTabId(),
+    name: z.string().min(1).max(60).optional().describe('流程名，给了就自动保存'),
+    saveTo: z.string().optional().describe('自定义 JSON 保存路径'),
+  },
+  record_list: {},
+  record_run: {
+    tabId: lenientTabId(),
+    name: z.string().min(1).describe('要回放的流程名'),
+    strict: bool().optional().default(true).describe('单步失败是否中断'),
+    stepDelayMs: num(z.number().min(0).max(5000)).optional().default(300),
+  },
+  record_delete: {
+    name: z.string().min(1).describe('要删除的流程名'),
+  },
+  record_export_gif: {
+    name: z.string().min(1),
+    saveTo: z.string().optional().describe('GIF 保存路径，默认 flows/ 下已存在'),
+  },
+  record_export_json: {
+    name: z.string().min(1),
+    saveTo: z.string().optional(),
+  },
   state: {},
 };
 
@@ -363,6 +393,13 @@ const DESCRIPTIONS = {
   intercept_add: 'Intercept and mock network requests on a tab (CDP Fetch). Add a rule that matches requests by URL wildcard (and optionally method): fail aborts them with a network error, fulfill answers with a mock status/headers/body (text via body, binary via bodyBase64, up to 1 MB), delay holds them for delayMs. The first matching rule wins. Cross-origin mocks get access-control-allow-origin echoed and access-control-allow-credentials added, and CORS preflights are answered automatically. Rules last until intercept_remove, the tab closes, or the debugger detaches (DevTools opened); they survive extension restarts. Mocked requests still show up in network_list as normal responses.',
   intercept_list: 'List the intercept rules on a tab with their hit counts and whether interception is currently active.',
   intercept_remove: 'Remove one intercept rule by id, or all rules on the tab (omit ruleId), which also turns interception off.',
+  record_start: 'Start recording user interactions on a tab. Events (click, input, key, navigate) are captured as replayable steps. Set captureGif:false to skip GIF frame capture.',
+  record_stop: 'Stop recording and return the captured steps. Provide a name to auto-save to ~/.browser-mcp/flows/<name>.json.',
+  record_list: 'List all saved recording flows with name, step count, GIF size, and recording time.',
+  record_run: 'Replay a saved flow by name. strict:true (default) stops on first failure; stepDelayMs controls delay between steps.',
+  record_delete: 'Delete a saved recording flow by name.',
+  record_export_gif: 'Export the GIF of a saved flow to a custom path.',
+  record_export_json: 'Export the JSON of a saved flow to a custom path.',
   storage: 'Read and write localStorage / sessionStorage of the tab\'s main frame, or summarize IndexedDB. Actions: list (keys with size and a short preview), get (one value, truncated at maxChars), set / remove / clear (writes), idb (read-only summary of databases, object stores and record counts; record contents are never read). Works on the top-level frame\'s origin only, not on iframes; the first line of every result shows the origin. Values are not masked, treat them like cookies.',
   state: 'Get a one-shot snapshot of the current browser state: active tab id/url/title, frame count, pending dialogs, buffered network requests, console error count, active intercept rules. Use this instead of tabs_list when you only need orientation.',
 };
@@ -390,16 +427,23 @@ const BASE_TIMEOUTS = {
   cookies: 10000, downloads: 610000,
   performance: 60000, emulate_device: 10000, emulate_network: 10000, emulate_geo: 10000, storage: 10000,
   intercept_add: 10000, intercept_list: 10000, intercept_remove: 10000,
+  record_start: 10000, record_stop: 30000, record_list: 5000,
+  record_run: 300000, // 5 分钟，长流程
+  record_delete: 5000, record_export_gif: 10000, record_export_json: 5000,
   state: 5000,
 };
 
 /** 会进扩展侧串行队列的工具；其超时叠加排队等待，避免排队期间被 relay 判超时 */
-const QUEUED_TOOLS = new Set(['computer', 'click', 'form_input', 'form_input_multi', 'navigate', 'file_upload', 'javascript_tool', 'tab_reload', 'storage']);
+const QUEUED_TOOLS = new Set(['computer', 'click', 'form_input', 'form_input_multi', 'navigate', 'file_upload', 'javascript_tool', 'tab_reload', 'storage', 'record_start', 'record_stop', 'record_run']);
 
 /** 最终生效的超时表 = 基础表 + 排队工具的 QUEUE_WAIT_MS */
 export const TOOL_TIMEOUTS = Object.fromEntries(
   Object.entries(BASE_TIMEOUTS).map(([name, ms]) => [name, QUEUED_TOOLS.has(name) ? ms + QUEUE_WAIT_MS : ms]),
 );
+
+/** 导出基础表与排队集合供测试与诊断使用（TOOL_TIMEOUTS 是两者的派生物） */
+export const BASE_TIMEOUTS_EXPORT = BASE_TIMEOUTS;
+export const QUEUED_TOOLS_EXPORT = QUEUED_TOOLS;
 
 // ─── Build a fresh McpServer with all tools registered ──────────────────────────
 
@@ -571,6 +615,27 @@ function stripXFile(result) {
   return result;
 }
 
+// ─── relay() 函数扩展：把 MCP 工具名映射为扩展侧方法 ──────────────────────
+
+const RecordMethod = Object.freeze({
+  record_start: 'record/start',
+  record_stop: 'record/stop',
+  record_run: 'record/run',
+  record_delete: 'record/delete',
+});
+
+/** sendToExtension 的错误包装：与 invokeTool 分支的报错形态一致 */
+async function invokeMethod(method, args, timeoutMs) {
+  try {
+    return await sendToExtension(method, args, timeoutMs);
+  } catch (err) {
+    return {
+      content: [{ type: 'text', text: `Error [${err.code || 'TOOL_ERROR'}]: ${err.message}` }],
+      isError: true,
+    };
+  }
+}
+
 // ─── Relay helper: call bridge and format MCP response ──────────────────────
 
 async function relay(tool, args) {
@@ -584,30 +649,129 @@ async function relay(tool, args) {
     };
   }
 
+  // 录制工具集的本地服务分支：扩展不参与的数据操作直接在 relay 完成。
+  // record_list 有本地索引但需扩展确认录制状态，统一走扩展分支。
   try {
-    const result = await invokeTool(tool, args, TOOL_TIMEOUTS[tool] || 60000);
-    // Extension already returns MCP-formatted content
-    if (result && result.content) {
-      let out = await spillLargeImages(await applySaveTo(args, result));
-      const xfile = await applyXFile(args, out);
-      if (xfile.error) {
-        return {
-          content: [...stripXFile(xfile.result).content, { type: 'text', text: xfile.error }],
-          isError: true,
-        };
-      }
-      return stripXFile(out);
-    }
-    return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    const localOnly = await handleRecordLocal(tool, args);
+    if (localOnly) return localOnly;
   } catch (err) {
     return {
-      content: [{
-        type: 'text',
-        text: `Error [${err.code || 'TOOL_ERROR'}]: ${err.message}`,
-      }],
+      content: [{ type: 'text', text: `Error [${err.code || 'TOOL_ERROR'}]: ${err.message}` }],
       isError: true,
     };
   }
+
+  // record_* 走专用方法名，其余工具沿用 tools/invoke
+  const result = RecordMethod[tool]
+    ? await invokeMethod(RecordMethod[tool], args, TOOL_TIMEOUTS[tool] || 60000)
+    : await (async () => {
+      try {
+        return await invokeTool(tool, args, TOOL_TIMEOUTS[tool] || 60000);
+      } catch (err) {
+        return {
+          content: [{ type: 'text', text: `Error [${err.code || 'TOOL_ERROR'}]: ${err.message}` }],
+          isError: true,
+        };
+      }
+    })();
+
+  // Extension already returns MCP-formatted content
+  if (result && result.content) {
+    // record_stop 保存流程：扩展把 steps（可能含 GIF 帧）带回 relay 落盘
+    if (result.saveFlow) {
+      try {
+        const saved = await saveFlowFromResult(result.saveFlow, args?.saveTo);
+        const textItem = result.content.find((c) => c.type === 'text');
+        const savedText = `Saved flow "${saved.name}" to ${saved.jsonPath}`
+          + (saved.gifPath ? ` (gif: ${saved.gifPath})` : ' (no gif)');
+        if (textItem) textItem.text += `\n${savedText}`;
+        else result.content.push({ type: 'text', text: savedText });
+      } catch (e) {
+        return {
+          content: [...result.content, { type: 'text', text: `Error: failed to save flow: ${e.message}` }],
+          isError: true,
+        };
+      }
+    }
+    let out = await spillLargeImages(await applySaveTo(args, result));
+    const xfile = await applyXFile(args, out);
+    if (xfile.error) {
+      return {
+        content: [...stripXFile(xfile.result).content, { type: 'text', text: xfile.error }],
+        isError: true,
+      };
+    }
+    return stripXFile(out);
+  }
+  return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+}
+
+/**
+ * record_* 的 relay 本地分支：这些操作只涉及 flows 目录，不需要扩展参与。
+ * 返回 MCP 响应表示已处理；返回 null 表示继续走扩展通道。
+ */
+async function handleRecordLocal(tool, args) {
+  switch (tool) {
+    case 'record_list': {
+      const flows = await flowsStore.listFlows();
+      const lines = flows.map((f) => {
+        const parts = [f.name];
+        parts.push(`${f.steps} step${f.steps === 1 ? '' : 's'}`);
+        parts.push(f.gifSize ? `gif ${formatSize(f.gifSize)}` : 'no gif');
+        if (f.recordedAt) parts.push(new Date(f.recordedAt).toISOString());
+        return parts.join(' | ');
+      });
+      return {
+        content: [{
+          type: 'text',
+          text: flows.length === 0
+            ? 'No saved flows. Use record_start / record_stop with a name to create one.'
+            : `${flows.length} flow(s):\n${lines.join('\n')}`,
+        }],
+      };
+    }
+    case 'record_export_gif': {
+      const res = await flowsStore.exportFlow(args.name, exportDestDir(args.saveTo), 'gif');
+      if (res.exported.length === 0) {
+        throw new Error(`Flow "${res.name}" has no GIF (recorded with captureGif:false?)`);
+      }
+      return { content: [{ type: 'text', text: `GIF exported to ${res.exported[0]}` }] };
+    }
+    case 'record_export_json': {
+      const res = await flowsStore.exportFlow(args.name, exportDestDir(args.saveTo), 'json');
+      return { content: [{ type: 'text', text: `JSON exported to ${res.exported[0]}` }] };
+    }
+    default:
+      return null;
+  }
+}
+
+/** export 的 saveTo 参数可以是目录（推荐）或文件路径；目录时导出文件用流程名 */
+function exportDestDir(saveTo) {
+  if (!saveTo) return os.homedir(); // 未指定时导出到用户主目录（flows/ 下已有原件）
+  if (!path.isAbsolute(saveTo)) throw new Error('saveTo must be an absolute path');
+  return saveTo.endsWith('.json') || saveTo.endsWith('.gif') ? path.dirname(saveTo) : saveTo;
+}
+
+/** record_stop 的 saveFlow 载荷落盘：合成 GIF（帧存在时）+ 写 JSON */
+async function saveFlowFromResult(saveFlow, customSaveTo) {
+  const { name, flow, frames } = saveFlow;
+  if (!name) throw new Error('saveFlow payload missing name');
+  if (!flow || !Array.isArray(flow.steps)) throw new Error('saveFlow payload missing steps');
+
+  let gifBuffer = null;
+  if (Array.isArray(frames) && frames.length > 0) {
+    const gifPath = path.join(flowsStore.getFlowsDir(), `${flowsStore.sanitizeName(name)}.gif`);
+    await gifComposer.composeGif(frames, gifPath);
+    gifBuffer = await fsp.readFile(gifPath);
+  }
+  const saved = await flowsStore.saveFlow(name, flow, gifBuffer);
+  if (customSaveTo) {
+    if (!path.isAbsolute(customSaveTo)) throw new Error('saveTo must be an absolute path');
+    await fsp.mkdir(path.dirname(customSaveTo), { recursive: true });
+    await fsp.copyFile(saved.jsonPath, customSaveTo);
+  }
+  return saved;
 }
 
 // ─── Express app ─────────────────────────────────────────────────────────────

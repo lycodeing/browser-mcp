@@ -37,11 +37,11 @@ test('公布的 schema 对数字/布尔/数组同时放行字符串形式', asyn
   }
 });
 
-test('工具清单恰好 37 个，旧工具已删除，新工具已就位', async () => {
+test('工具清单恰好 44 个，旧工具已删除，新工具已就位', async () => {
   const client = await connectClient();
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name);
-  assert.equal(names.length, 37);
+  assert.equal(names.length, 44);
   for (const old of ['tabs_context', 'tabs_create', 'tabs_close', 'read_network_requests', 'tabs', 'network', 'emulate']) {
     assert.ok(!names.includes(old), `${old} 应被删除`);
   }

@@ -5,7 +5,8 @@
 
 let extensionWs = null;
 let nextMessageId = 1;
-const pendingRequests = new Map(); // messageId -> { resolve, reject, timer }
+const pendingRequests = new Map(); // messageId -> { resolve, reject, timer, tool }
+const pendingExtensionRequests = new Map(); // method -> async (params) => result
 const extensionInfo = { version: null, browserType: null, capabilities: [] };
 
 export function setExtensionWs(ws) {
@@ -68,7 +69,38 @@ export function handleExtensionMessage(rawData) {
     } else {
       pending.resolve(msg.result);
     }
+    return;
   }
+
+  // 扩展主动发起的请求（有 id 且带 method）：交给注册的 handler 处理，
+  // 处理结果（或错误）以相同 id 回给扩展。未注册 method 时回错而非挂起扩展。
+  if (typeof msg.id === 'number' && msg.method) {
+    if (!pendingExtensionRequests.has(msg.method)) {
+      sendResponseToExtension(msg.id, { error: { code: 'METHOD_NOT_FOUND', message: `Unknown extension request method: ${msg.method}` } });
+      return;
+    }
+    Promise.resolve()
+      .then(() => pendingExtensionRequests.get(msg.method)(msg.params || {}))
+      .then((result) => sendResponseToExtension(msg.id, { result: result ?? {} }))
+      .catch((err) => sendResponseToExtension(msg.id, { error: { code: err.code || 'HANDLER_ERROR', message: err.message } }));
+  }
+}
+
+/** 以扩展约定的消息形态回写响应：响应不携带 method，只带 id */
+function sendResponseToExtension(id, payload) {
+  if (!isConnected()) return;
+  try {
+    extensionWs.send(JSON.stringify({ id, ...payload }));
+  } catch { /* 连接已断时丢弃即可，扩展会按超时处理 */ }
+}
+
+/**
+ * 注册扩展主动请求的处理器（如 flows/composeGif、flows/save）。
+ * 同名 method 重复注册时后者覆盖前者；返回注销函数。
+ */
+export function onExtensionRequest(method, handler) {
+  pendingExtensionRequests.set(method, handler);
+  return () => pendingExtensionRequests.delete(method);
 }
 
 /**
@@ -95,6 +127,35 @@ export function invokeTool(tool, args, timeoutMs = 60000) {
         method: 'tools/invoke',
         params: { tool, arguments: args ?? {} }
       }));
+    } catch (err) {
+      pendingRequests.delete(id);
+      clearTimeout(timer);
+      reject(err);
+    }
+  });
+}
+
+/**
+ * 向扩展发起任意 method 调用并等待响应（invokeTool 的通用版）。
+ * record_* 工具里需要扩展侧数据的操作（record_list/run/delete 等）走这里。
+ */
+export function sendToExtension(method, params, timeoutMs = 60000) {
+  return new Promise((resolve, reject) => {
+    if (!isConnected()) {
+      reject(new Error('No extension connected. Make sure the Chrome extension is running and connected.'));
+      return;
+    }
+
+    const id = nextMessageId++;
+    const timer = setTimeout(() => {
+      pendingRequests.delete(id);
+      reject(new Error(`Extension call "${method}" timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    pendingRequests.set(id, { resolve, reject, timer, tool: method });
+
+    try {
+      extensionWs.send(JSON.stringify({ id, method, params: params ?? {} }));
     } catch (err) {
       pendingRequests.delete(id);
       clearTimeout(timer);

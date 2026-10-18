@@ -46,7 +46,7 @@ test('非排队工具的超时不受排队等待影响', () => {
 
 test('超时表覆盖全部工具且不含旧工具名', () => {
   const names = Object.keys(TOOL_TIMEOUTS).sort();
-  assert.equal(names.length, 37);
+  assert.equal(names.length, 44);
   for (const old of ['tabs_context', 'tabs_create', 'tabs_close', 'read_network_requests', 'tabs', 'network', 'emulate']) {
     assert.ok(!names.includes(old), `${old} 应被删除`);
   }
