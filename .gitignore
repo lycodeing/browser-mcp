@@ -2,3 +2,6 @@ node_modules/
 .DS_Store
 *.log
 .zcode/
+
+# 本地会话产物目录：需求理解、界面示意、技术设计、任务档案，不入库
+.dev-docs/

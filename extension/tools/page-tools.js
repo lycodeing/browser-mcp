@@ -1,6 +1,7 @@
 // javascript_tool / get_page_text / file_upload 的胶水实现（C 批从 background.js 搬迁并补齐 frame 支持）。
-// 依赖（chrome、ok、err、ensureCdp、ensureCs、parseRef、runInRefFrame、collectFrameInfos、resolveFrameOffset、toTopPoint、sleep）
-// 通过参数注入；坐标换算复用 A 批的跨 frame 握手（getElemCoords 由 background 传入）。
+// 依赖通过参数注入：chrome、ok、err、ensureCdp、ensureCs、runInRefFrame、getElemCoords、sleep、frameContexts。
+// frameContexts 是 tabId -> [{ id, frameId, isDefault }]，用于定位子 frame 的主世界执行上下文；
+// 坐标换算复用 A 批的跨 frame 握手（getElemCoords 由 background 传入）。
 
 import { formatJsResult, truncateResult, MAX_CODE_CHARS, wrapExpression, pickContextId } from '../lib/js-tool.js';
 import { mergeFrameTexts, formatSingleFrameText } from '../lib/page-text.js';
@@ -126,9 +127,9 @@ export function createPageTools({ chrome, ok, err, ensureCdp, ensureCs, runInRef
   }
 
   // ── file_upload ──────────────────────────────────────────────────────────────
-  // ref 路径：DOM.performSearch 是跨 frame 的全局搜索（DevTools 元素面板同款机制），
-  // 拿 nodeId 后 DOM.setFileInputFiles；triggerRef 路径：点击坐标复用跨 frame 握手，
-  // fileChooserOpened 的 backendNodeId 本就 frame 无关。
+  // ref 路径：在目标 frame 的主世界上下文里 Runtime.evaluate 取元素 objectId，
+  // 再 DOM.setFileInputFiles({files, objectId})——objectId 天然跨 frame，无需 DOM 域。
+  // triggerRef 路径：点击坐标复用跨 frame 握手，fileChooserOpened 的 backendNodeId 本就 frame 无关。
   async function toolFileUpload(args) {
     const { tabId, paths, ref, triggerRef } = args;
     if (!tabId) return err('tabId required');
