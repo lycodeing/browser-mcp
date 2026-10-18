@@ -307,6 +307,10 @@ browser-mcp/
 
 欢迎提 Issue 和 Pull Request。提交前请先运行 `npm test`。
 
+改动扩展代码后，用 `curl -X POST http://127.0.0.1:3000/reload` 让扩展重新加载即可生效。
+
+各版本的工具变化见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 许可证
 
 [MIT](LICENSE) © lycodeing
