@@ -786,7 +786,8 @@ export function startMcpServer(port = 3000) {
   onExtensionRequest('flow/list', async () => ({ flows: await flowsStore.listFlows() }));
   onExtensionRequest('flow/load', async ({ name }) => {
     if (!name) throw new Error('flow/load requires params.name');
-    return { flow: await flowsStore.loadFlow(name) };
+    // 直接返回 flow 本体，扩展侧的 flow.steps 需要能直接命中
+    return await flowsStore.loadFlow(name);
   });
   // intercept_add 的 bodyBase64 上限 1 MB（解码后），base64 后约 1.4 MB，再经 JSON 包装需留余量；
   // 默认 100 KB 会让大二进制 Mock 直接 413。network_detail 的响应体也走同一通道。

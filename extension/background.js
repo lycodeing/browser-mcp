@@ -264,10 +264,11 @@ async function toolRecordStart(args) {
     });
     const readyFrames = prepared.filter(r => r.result === true);
     frameCount = readyFrames.length;
+    // chrome.runtime.sendMessage 从 SW 发不到自己，必须用 chrome.tabs.sendMessage 发到 tab 的 content script
     for (const fr of readyFrames) {
-      await chrome.runtime.sendMessage({
+      await chrome.tabs.sendMessage(tabId, {
         type: 'recorder:activate', tabId, frameId: fr.frameId,
-      }).catch(() => {});
+      }, { frameId: fr.frameId }).catch(() => {});
     }
     if (!frameCount) throw new Error('recorder content script not present in any frame');
   } catch (e) {
