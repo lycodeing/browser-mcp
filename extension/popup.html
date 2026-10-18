@@ -6,63 +6,222 @@
   <title>browser-mcp</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { width: 280px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      font-size: 13px; color: #1a1a1a; background: #fff; }
-    .header { padding: 14px 16px 10px; border-bottom: 1px solid #eee; display: flex;
-      align-items: center; gap: 8px; }
-    .logo { width: 22px; height: 22px; background: #2563eb; border-radius: 5px;
+    body {
+      width: 360px;
+      font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      font-size: 13px; color: #1a1a1a; background: #fff;
+    }
+
+    /* ── Header ── */
+    .header {
+      padding: 12px 16px; border-bottom: 1px solid #e5e7eb;
+      display: flex; align-items: center; gap: 8px; background: #f9fafb;
+    }
+    .logo {
+      width: 28px; height: 28px; background: #2563eb; border-radius: 6px;
       display: flex; align-items: center; justify-content: center;
-      color: #fff; font-weight: 700; font-size: 11px; flex-shrink: 0; }
+      color: #fff; font-weight: 700; font-size: 13px; flex-shrink: 0;
+    }
     .title { font-weight: 600; font-size: 14px; }
-    .subtitle { font-size: 11px; color: #888; margin-top: 1px; }
-    .section { padding: 12px 16px; border-bottom: 1px solid #f0f0f0; }
-    .row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
-    .row:last-child { margin-bottom: 0; }
-    .label { color: #555; }
-    .badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
-    .badge-green { background: #dcfce7; color: #16a34a; }
-    .badge-red   { background: #fee2e2; color: #dc2626; }
-    .badge-gray  { background: #f3f4f6; color: #6b7280; }
-    .url { font-family: 'SF Mono', Consolas, monospace; font-size: 11px; color: #2563eb;
-      background: #eff6ff; padding: 4px 8px; border-radius: 4px; word-break: break-all;
-      margin-top: 6px; }
-    .footer { padding: 10px 16px; }
-    button { width: 100%; padding: 7px; border: 1px solid #d1d5db; border-radius: 6px;
-      background: #f9fafb; cursor: pointer; font-size: 12px; color: #374151;
-      transition: background 0.15s; }
-    button:hover { background: #f3f4f6; }
-    #dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-      margin-right: 4px; background: #d1d5db; }
-    #dot.green { background: #22c55e; }
-    #dot.red   { background: #ef4444; }
+    .version { font-size: 11px; color: #9ca3af; margin-left: auto; }
+
+    /* ── Tab 栏 ── */
+    .tabs { display: flex; border-bottom: 1px solid #e5e7eb; background: #f9fafb; }
+    .popup-tab {
+      flex: 1; padding: 9px 0; text-align: center; font-size: 13px;
+      color: #6b7280; cursor: pointer; border-bottom: 2px solid transparent;
+      transition: all 0.15s; user-select: none;
+    }
+    .popup-tab.active {
+      color: #2563eb; border-bottom-color: #2563eb; font-weight: 600; background: #fff;
+    }
+    .popup-tab:hover:not(.active) { background: #f3f4f6; }
+
+    /* ── 内容区 ── */
+    .tab-body { display: none; padding: 16px; min-height: 280px; }
+    .tab-body.active { display: block; }
+
+    /* 状态 tab */
+    .status-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 8px 0; border-bottom: 1px solid #f3f4f6;
+    }
+    .status-row:last-child { border-bottom: none; }
+    .status-label { color: #6b7280; }
+    .status-value { font-weight: 500; }
+    .status-value.ok { color: #16a34a; }
+    .status-value.err { color: #dc2626; }
+    .status-dot {
+      display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px;
+    }
+    .status-dot.green { background: #22c55e; }
+    .status-dot.red { background: #ef4444; }
+    .status-dot.gray { background: #d1d5db; }
+    .mono-block { margin: 6px 0 10px; }
+    .mono {
+      font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 11px;
+      color: #2563eb; background: #eff6ff; padding: 3px 8px;
+      border-radius: 4px; word-break: break-all;
+    }
+
+    /* 录制 tab */
+    .not-recording {
+      display: flex; align-items: center; gap: 10px; padding: 14px;
+      background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px;
+      margin-bottom: 14px; color: #6b7280;
+    }
+    .recording-indicator {
+      display: flex; align-items: center; gap: 10px; padding: 14px;
+      background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px;
+      margin-bottom: 14px;
+    }
+    .rec-dot {
+      width: 12px; height: 12px; border-radius: 50%; background: #ef4444;
+      animation: pulse 1.2s ease-in-out infinite; flex-shrink: 0;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.6; transform: scale(1.15); }
+    }
+    .rec-text { color: #991b1b; font-weight: 600; }
+    .rec-sub { color: #dc2626; font-size: 12px; }
+
+    .form-group { margin-top: 12px; }
+    .form-label { font-size: 12px; color: #6b7280; margin-bottom: 4px; display: block; }
+    .form-input {
+      width: 100%; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 6px;
+      font-size: 13px; outline: none; transition: border-color 0.15s;
+    }
+    .form-input:focus { border-color: #2563eb; }
+    .form-checkbox {
+      display: flex; align-items: center; gap: 8px; margin-top: 10px;
+      font-size: 13px; color: #374151; cursor: pointer;
+    }
+    .form-checkbox input[type="checkbox"] { width: 16px; height: 16px; accent-color: #2563eb; }
+
+    .btn {
+      width: 100%; padding: 10px; border: none; border-radius: 8px;
+      font-size: 13px; font-weight: 600; cursor: pointer;
+      transition: all 0.15s; display: flex; align-items: center;
+      justify-content: center; gap: 8px; font-family: inherit;
+    }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary { background: #2563eb; color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: #1d4ed8; }
+    .btn-danger { background: #dc2626; color: #fff; }
+    .btn-danger:hover:not(:disabled) { background: #b91c1c; }
+    .btn-secondary { background: #f3f4f6; color: #374151; border: 1px solid #d1d5db; }
+    .btn-secondary:hover:not(:disabled) { background: #e5e7eb; }
+
+    .hint {
+      font-size: 11px; color: #9ca3af; margin-top: 8px;
+      text-align: center; line-height: 1.5;
+    }
+
+    /* 流程 tab */
+    .flow-item {
+      background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px;
+      padding: 12px; margin-bottom: 10px;
+    }
+    .flow-item:last-child { margin-bottom: 0; }
+    .flow-name { font-weight: 600; color: #1a202c; margin-bottom: 2px; }
+    .flow-meta { font-size: 11px; color: #9ca3af; margin-bottom: 8px; }
+    .flow-actions { display: flex; gap: 6px; }
+    .flow-actions .btn { flex: 1; padding: 5px 8px; font-size: 12px; border-radius: 5px; }
+    .flow-actions .btn-del { flex: 0 0 44px; }
+
+    .empty-state { text-align: center; padding: 40px 20px; color: #9ca3af; font-size: 13px; }
+    .empty-state .icon { font-size: 36px; margin-bottom: 8px; }
+    .empty-state .tip { margin-top: 6px; font-size: 12px; }
+
+    /* 顶部浮动提示条 */
+    .toast {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      padding: 8px 16px; font-size: 12px; text-align: center;
+      color: #fff; transform: translateY(-100%); transition: transform 0.2s;
+    }
+    .toast.show { transform: translateY(0); }
+    .toast.error { background: #dc2626; }
+    .toast.success { background: #16a34a; }
   </style>
 </head>
 <body>
   <div class="header">
     <div class="logo">B</div>
-    <div>
-      <div class="title">browser-mcp</div>
-      <div class="subtitle">Browser automation for AI agents</div>
+    <div class="title">browser-mcp</div>
+    <div class="version">v2.4.0</div>
+  </div>
+
+  <div class="tabs">
+    <div class="popup-tab active" data-tab="status">状态</div>
+    <div class="popup-tab" data-tab="record">录制</div>
+    <div class="popup-tab" data-tab="flows">流程</div>
+  </div>
+
+  <!-- 状态 Tab -->
+  <div id="tab-status" class="tab-body active">
+    <div class="status-row">
+      <span class="status-label"><span id="status-dot" class="status-dot gray"></span>Relay 连接</span>
+      <span id="status-value" class="status-value">检测中…</span>
+    </div>
+    <div class="status-row"><span class="status-label">Relay 地址</span></div>
+    <div class="mono-block"><span id="relay-url" class="mono">—</span></div>
+    <div class="status-row"><span class="status-label">MCP 端点</span></div>
+    <div class="mono-block"><span class="mono">http://127.0.0.1:3000/mcp</span></div>
+    <div style="margin-top:14px">
+      <button id="retry-btn" class="btn btn-secondary" style="font-size:12px;padding:7px">🔄 重连</button>
     </div>
   </div>
 
-  <div class="section">
-    <div class="row">
-      <span class="label"><span id="dot"></span>Relay connection</span>
-      <span id="status-badge" class="badge badge-gray">—</span>
+  <!-- 录制 Tab -->
+  <div id="tab-record" class="tab-body">
+    <div id="rec-off" class="not-recording">
+      <span style="font-size:20px">⚫</span>
+      <span>当前未在录制</span>
     </div>
-    <div id="relay-url" style="font-size:11px;color:#888;margin-top:4px;word-break:break-all"></div>
-    <div id="retry-count" style="font-size:11px;color:#aaa"></div>
-    <div class="row">
-      <span class="label">MCP endpoint</span>
+    <div id="rec-on" class="recording-indicator" style="display:none">
+      <div class="rec-dot"></div>
+      <div>
+        <div class="rec-text">🔴 正在录制</div>
+        <div id="rec-sub" class="rec-sub">00:00 · 已捕获 0 步</div>
+      </div>
     </div>
-    <div class="url">http://127.0.0.1:3000/mcp</div>
+
+    <button id="start-btn" class="btn btn-primary">▶ 开始录制当前标签页</button>
+    <p id="start-hint" class="hint">录制期间请在浏览器里正常操作，做完回到这里点"停止"</p>
+
+    <div id="rec-form" style="display:none">
+      <div class="form-group">
+        <label class="form-label" for="flow-name">流程名称</label>
+        <input id="flow-name" type="text" class="form-input" placeholder="例如：下载商品主图" maxlength="50" />
+      </div>
+      <label class="form-checkbox">
+        <input id="save-gif" type="checkbox" checked />
+        <span>同时导出 GIF 动图（用于分享/写文档）</span>
+      </label>
+      <div style="margin-top:14px">
+        <button id="stop-btn" class="btn btn-danger">⏹ 停止并保存</button>
+      </div>
+      <div style="margin-top:8px">
+        <button id="cancel-btn" class="btn btn-secondary" style="font-size:12px;padding:6px">✕ 取消录制（不保存）</button>
+      </div>
+    </div>
   </div>
 
-  <div class="footer">
-    <button id="retry-btn">Retry connection</button>
+  <!-- 流程 Tab -->
+  <div id="tab-flows" class="tab-body">
+    <div id="flows-empty" class="empty-state">
+      <div class="icon">📂</div>
+      <div>暂无保存的流程</div>
+      <div class="tip">去「录制」tab 开始录制</div>
+    </div>
+    <div id="flows-list"></div>
   </div>
 
-  <script src="popup.js"></script>
+  <!-- 顶部浮动提示条 -->
+  <div id="toast" class="toast"></div>
+
+  <script type="module" src="popup-utils.js"></script>
+  <script type="module" src="popup.js"></script>
 </body>
 </html>
