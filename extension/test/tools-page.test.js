@@ -10,7 +10,7 @@ const err = msg => ({ content: [{ type: 'text', text: `Error: ${msg}` }], isErro
 const text = r => r.content[0].text;
 
 // executeScript 按 target 返回结果：frameIds 命中返回该 frame，allFrames 返回全部
-function makeChrome({ frames = {}, executeResults, fileChooser, searchResult } = {}) {
+function makeChrome({ frames = {}, fileChooser, searchResult, evalResult, frameTree } = {}) {
   const calls = [];
   const listeners = [];
   const chrome = {
@@ -30,7 +30,15 @@ function makeChrome({ frames = {}, executeResults, fileChooser, searchResult } =
         if (method === 'DOM.performSearch') return searchResult ?? { searchId: 's1', resultCount: 1 };
         if (method === 'DOM.getSearchResults') return { nodeIds: [77] };
         if (method === 'Page.createIsolatedWorld') return { executionContextId: 9 };
-        if (method === 'Runtime.evaluate') return { result: { value: 'cdp-fallback' } };
+        if (method === 'Page.getFrameTree') {
+          return frameTree ?? { frameTree: { frame: { id: 'MAIN', url: 'http://a.test/', name: '' }, childFrames: [
+            { frame: { id: 'CDP-3', url: 'http://b.test/', name: '' } },
+          ] } };
+        }
+        if (method === 'Runtime.evaluate') {
+          if (evalResult !== undefined) return typeof evalResult === 'function' ? evalResult(params) : evalResult;
+          return { result: { value: 'cdp', objectId: 'obj-1' } };
+        }
         if (method === 'Page.fileChooserOpened') return fileChooser;
         return {};
       },
@@ -40,67 +48,100 @@ function makeChrome({ frames = {}, executeResults, fileChooser, searchResult } =
   return { chrome, calls, listeners };
 }
 
+const DEFAULT_FRAMES = {
+  0: { url: 'http://a.test/', name: '', title: 'T0', content: 'main body' },
+  3: { url: 'http://b.test/', name: '', title: 'T3', content: 'sub body' },
+};
+
 function setup(opts = {}) {
+  if (!opts.frames) opts = { ...opts, frames: DEFAULT_FRAMES };
   const { chrome, calls, listeners } = makeChrome(opts);
   const runInRefFrame = async (tabId, parsed, func, args) => {
     if (opts.missingFrames?.has(parsed.frameId)) return undefined;
-    return (opts.refFrameResult?.(parsed, func, args)) ?? { tag: 'INPUT' };
+    return (opts.refFrameResult?.(parsed, func, args)) ?? { tag: 'input', isFile: true };
   };
   const getElemCoords = async () => ({ x: 10, y: 20 });
+  const frameContexts = new Map();
+  if (opts.contexts) frameContexts.set(opts.contexts.tabId, opts.contexts.list);
   const tools = createPageTools({
     chrome, ok, err,
     ensureCdp: async () => {},
     ensureCs: async () => {},
     runInRefFrame, getElemCoords,
     sleep: async () => {},
+    frameContexts,
   });
   return { tools, calls, listeners };
 }
 
-// ── javascript_tool ───────────────────────────────────────────────────────────
+// ── javascript_tool（C 批修复后走 CDP Runtime.evaluate，绕开页面 CSP）────────
 
-test('默认路由到主 frame（frameIds:[0]），表达式与语句两条路都能跑', async () => {
-  const t = setup({ frames: { 0: { ok: true, v: 'main' } } });
+test('主 frame：不带 contextId 调用 Runtime.evaluate，表达式用括号包装', async () => {
+  const t = setup({ evalResult: { result: { value: 'main' } } });
   const r = await t.tools.toolJavascript({ tabId: 1, text: "'a'+1" });
   assert.equal(r.isError, undefined);
   assert.equal(text(r), 'main');
-  assert.deepEqual(t.calls[0].opts.target, { tabId: 1, frameIds: [0] });
+  const ev = t.calls.find(c => c.method === 'Runtime.evaluate');
+  assert.equal(ev.params.expression, "('a'+1)");
+  assert.equal(ev.params.contextId, undefined);
 });
 
-test('frameId 路由到指定子 frame', async () => {
-  const t = setup({ frames: { 3: { ok: true, v: 'in-f3' } } });
+test('语句形式包成 async IIFE', async () => {
+  const t = setup({ evalResult: { result: { value: 3 } } });
+  await t.tools.toolJavascript({ tabId: 1, text: 'const x = 3; return x;' });
+  const ev = t.calls.find(c => c.method === 'Runtime.evaluate');
+  assert.match(ev.params.expression, /^\(async function\(\)\{const x = 3; return x;\}\)\(\)$/);
+});
+
+test('frameId 经 CDP id 映射后取该 frame 的主世界上下文（isDefault）', async () => {
+  const t = setup({
+    evalResult: { result: { value: 'in-f3' } },
+    contexts: { tabId: 1, list: [
+      { id: 11, frameId: 'MAIN', isDefault: true, name: '' },
+      { id: 33, frameId: 'CDP-3', isDefault: true, name: '' },
+      { id: 34, frameId: 'CDP-3', isDefault: false, name: 'ext' },
+    ] },
+  });
   const r = await t.tools.toolJavascript({ tabId: 1, frameId: 3, text: 'location.href' });
   assert.equal(text(r), 'in-f3');
-  assert.deepEqual(t.calls[0].opts.target, { tabId: 1, frameIds: [3] });
+  const ev = t.calls.find(c => c.method === 'Runtime.evaluate');
+  assert.equal(ev.params.contextId, 33);
 });
 
-test('frame 不存在时明确报错，不落回主 frame', async () => {
-  const t = setup({ frames: { 0: { ok: true, v: 'main' } } });
+test('数字 frameId 映射不到 CDP id 时报 Frame not found', async () => {
+  const t = setup({ evalResult: { result: { value: 'x' } } });
   const r = await t.tools.toolJavascript({ tabId: 1, frameId: 9, text: '1' });
   assert.equal(r.isError, true);
   assert.match(text(r), /Frame f9 not found/);
 });
 
-test('页面 eval 抛错时把错误透传', async () => {
-  const t = setup({ frames: { 0: { ok: false, e: 'ReferenceError: x is not defined' } } });
+test('无已知上下文时退回 createIsolatedWorld 并在该上下文求值', async () => {
+  const t = setup({ evalResult: { result: { value: 'iso' } } });
+  const r = await t.tools.toolJavascript({ tabId: 1, frameId: 3, text: '1' });
+  assert.equal(text(r), 'iso');
+  const iso = t.calls.find(c => c.method === 'Page.createIsolatedWorld');
+  assert.deepEqual(iso.params.frameId, 'CDP-3');
+  const ev = t.calls.find(c => c.method === 'Runtime.evaluate');
+  assert.equal(ev.params.contextId, 9);
+});
+
+test('表达式语法错时用 async IIFE 重试（多语句片段）', async () => {
+  let n = 0;
+  const t = setup({ evalResult: (params) => {
+    n++;
+    if (params.expression.startsWith('(async function()')) return { result: { value: 'retried' } };
+    return { exceptionDetails: { text: "SyntaxError: Unexpected token ';'" } };
+  } });
+  const r = await t.tools.toolJavascript({ tabId: 1, text: 'a(); b();' });
+  assert.equal(text(r), 'retried');
+  assert.equal(n, 2);
+});
+
+test('页面抛错时把错误作为工具错误返回（不再被吞）', async () => {
+  const t = setup({ evalResult: { exceptionDetails: { exception: { description: 'ReferenceError: x is not defined' } } } });
   const r = await t.tools.toolJavascript({ tabId: 1, text: 'x' });
   assert.equal(r.isError, true);
   assert.match(text(r), /ReferenceError/);
-});
-
-test('executeScript 失败时走 createIsolatedWorld + Runtime.evaluate 兜底', async () => {
-  const frames = new Proxy({}, { get: () => { throw new Error('cannot inject into this page'); } });
-  const t = setup({ frames });
-  const r = await t.tools.toolJavascript({ tabId: 1, text: 'location.href' });
-  // 代理抛错后 executeScript mock 本身不会抛——这里直接验证兜底分支可通过 chrome 直调触发：
-  // 真实场景是 executeScript reject。此用例验证 cdp 命令序列在兜底路径下正确。
-  const cdp = t.calls.filter(c => c.kind === 'cdp').map(c => c.method);
-  if (r.isError) {
-    assert.match(text(r), /cannot inject|Frame f0 not found/);
-  } else {
-    assert.ok(cdp.includes('Page.createIsolatedWorld') && cdp.includes('Runtime.evaluate'));
-    assert.equal(text(r), 'cdp-fallback');
-  }
 });
 
 // ── get_page_text ────────────────────────────────────────────────────────────
@@ -142,32 +183,38 @@ test('frame 不存在时明确报错', async () => {
   assert.match(text(r), /Frame f9 not found/);
 });
 
-// ── file_upload ──────────────────────────────────────────────────────────────
+// ── file_upload（C 批修复后走 CDP objectId，天然支持子 frame）──────────────────
 
-test('ref 带子 frame 前缀：performSearch 全局搜索 → setFileInputFiles', async () => {
+test('ref 带子 frame 前缀：映射 CDP frame → 上下文求值取 objectId → setFileInputFiles', async () => {
   const t = setup();
   const r = await t.tools.toolFileUpload({ tabId: 1, paths: ['/tmp/a.png'], ref: 'f3.ref_7' });
   assert.equal(r.isError, undefined);
   assert.match(text(r), /File\(s\) set on input f3\.ref_7/);
   const methods = t.calls.filter(c => c.kind === 'cdp').map(c => c.method);
-  assert.ok(methods.includes('DOM.performSearch'));
-  assert.ok(methods.includes('DOM.getSearchResults'));
+  assert.ok(methods.includes('Page.getFrameTree'), '需要 CDP frame tree 做 id 映射');
   const set = t.calls.find(c => c.method === 'DOM.setFileInputFiles');
-  assert.deepEqual(set.params, { files: ['/tmp/a.png'], nodeId: 77 });
+  assert.deepEqual(set.params, { files: ['/tmp/a.png'], objectId: 'obj-1' });
 });
 
-test('ref 元素不是 input 时报错', async () => {
-  const t = setup({ refFrameResult: () => ({ tag: 'BUTTON' }) });
-  const r = await t.tools.toolFileUpload({ tabId: 1, paths: ['/tmp/a'], ref: 'ref_2' });
-  assert.equal(r.isError, true);
-  assert.match(text(r), /is <button>, not an input/);
+test('主 frame ref 也能设文件', async () => {
+  const t = setup();
+  const r = await t.tools.toolFileUpload({ tabId: 1, paths: ['/tmp/b.png'], ref: 'ref_2' });
+  assert.equal(r.isError, undefined);
+  assert.match(text(r), /File\(s\) set on input ref_2/);
 });
 
-test('performSearch 命中数不是 1 时报错', async () => {
-  const t = setup({ searchResult: { searchId: 's1', resultCount: 0 } });
+test('ref 指向非文件输入时报错', async () => {
+  const t = setup({ refFrameResult: () => ({ tag: 'button', isFile: false }) });
   const r = await t.tools.toolFileUpload({ tabId: 1, paths: ['/tmp/a'], ref: 'ref_2' });
   assert.equal(r.isError, true);
-  assert.match(text(r), /found 0/);
+  assert.match(text(r), /is <button>, not an input\[type=file\]/);
+});
+
+test('目标 frame 映射不到 CDP id 时报 Element not found', async () => {
+  const t = setup({ frameTree: { frameTree: { frame: { id: 'MAIN', url: 'http://a.test/', name: '' } } } });
+  const r = await t.tools.toolFileUpload({ tabId: 1, paths: ['/tmp/a'], ref: 'f99.ref_1' });
+  assert.equal(r.isError, true);
+  assert.match(text(r), /Element not found: f99\.ref_1/);
 });
 
 test('ref 在已消失的 frame 里时报错', async () => {
@@ -178,12 +225,8 @@ test('ref 在已消失的 frame 里时报错', async () => {
 });
 
 test('triggerRef 子 frame：点击坐标 → fileChooserOpened.backendNodeId → 设文件', async () => {
-  let chooserListener;
   const t = setup({ fileChooser: { backendNodeId: 555 } });
-  // 装一个假的 onEvent 派发器：点击后立即派发 fileChooserOpened
-  const origSetup = t;
   const p = t.tools.toolFileUpload({ tabId: 1, paths: ['/tmp/b.png'], triggerRef: 'f3.ref_2' });
-  // 在 sendCommand 捕获到 mouseReleased 后触发 chooser
   setTimeout(() => {
     t.listeners.forEach(h => h({ tabId: 1 }, 'Page.fileChooserOpened', { backendNodeId: 555 }));
   }, 10);

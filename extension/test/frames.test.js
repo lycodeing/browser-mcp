@@ -116,3 +116,61 @@ test('resolveFrameOffset 握手链路不完整返回 null', () => {
   assert.equal(resolveFrameOffset(3, infos), null);
   assert.equal(resolveFrameOffset(9, infos), null);
 });
+
+// ── C 批修复：两套 frame 标识的映射 ──────────────────────────────────────────────
+
+test('flattenFrameTree：前序拍平，保留 parentId', async () => {
+  const { flattenFrameTree } = await import('../lib/frames.js');
+  const tree = {
+    frame: { id: 'MAIN', url: 'http://a/', name: '' },
+    childFrames: [
+      { frame: { id: 'F1', url: 'http://b/', name: 'sub' }, childFrames: [
+        { frame: { id: 'F2', url: 'http://c/', name: '' } },
+      ] },
+    ],
+  };
+  const flat = flattenFrameTree(tree);
+  assert.deepEqual(flat.map(f => f.id), ['MAIN', 'F1', 'F2']);
+  assert.equal(flat[0].parentId, undefined);
+  assert.equal(flat[1].parentId, 'MAIN');
+  assert.equal(flat[2].parentId, 'F1');
+});
+
+test('buildFrameIdMap：URL+name 精确配对优先', async () => {
+  const { buildFrameIdMap } = await import('../lib/frames.js');
+  const ext = [
+    { frameId: 0, url: 'http://a/', name: '' },
+    { frameId: 3381, url: 'http://b/', name: 'sub' },
+  ];
+  const cdp = [
+    { id: 'MAIN', url: 'http://a/', name: '' },
+    { id: 'CDP-1', url: 'http://b/', name: 'sub' },
+  ];
+  const map = buildFrameIdMap(ext, cdp);
+  assert.equal(map.get(0), 'MAIN');
+  assert.equal(map.get(3381), 'CDP-1');
+});
+
+test('buildFrameIdMap：同 URL 多帧按出现顺序补齐，不重复占用', async () => {
+  const { buildFrameIdMap } = await import('../lib/frames.js');
+  const ext = [
+    { frameId: 0, url: 'http://a/', name: '' },
+    { frameId: 10, url: 'http://same/', name: '' },
+    { frameId: 11, url: 'http://same/', name: '' },
+  ];
+  const cdp = [
+    { id: 'MAIN', url: 'http://a/', name: '' },
+    { id: 'S1', url: 'http://same/', name: '' },
+    { id: 'S2', url: 'http://same/', name: '' },
+  ];
+  const map = buildFrameIdMap(ext, cdp);
+  assert.equal(map.get(10), 'S1');
+  assert.equal(map.get(11), 'S2');
+});
+
+test('buildFrameIdMap：CDP 树里没有的 frame 不产生映射', async () => {
+  const { buildFrameIdMap } = await import('../lib/frames.js');
+  const map = buildFrameIdMap([{ frameId: 5, url: 'http://x/', name: '' }], []);
+  assert.equal(map.get(5), undefined);
+  assert.equal(map.size, 0);
+});
